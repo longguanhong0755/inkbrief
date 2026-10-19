@@ -156,7 +156,7 @@ function clearPreview() {
 // ---------------- 生成 ----------------
 function newWorker() {
   if (worker) { try { worker.terminate(); } catch (e) { /* ignore */ } }
-  worker = new Worker('js/worker.js?v=1');
+  worker = new Worker('js/worker.js?v=3');
   worker.onmessage = onWorker;
   worker.onerror = (e) => {
     workerBusy = false;
@@ -515,6 +515,22 @@ async function init() {
     ? '"MaShanZheng", "KaiTi", "STKaiti", "楷体", serif'
     : '"KaiTi", "STKaiti", "楷体", serif';
   if (!fontOk) console.warn('Ma Shan Zheng 未加载，已回退系统楷体');
+  // 字体 5.9MB，慢网可能几秒到几分钟；先在后台继续加载，好了再换回来
+  if (!fontOk && document.fonts && document.fonts.ready) {
+    document.fonts.ready.then(() => {
+      if (!document.fonts.check('46px "MaShanZheng"')) return;
+      fontOk = true;
+      fontFamily = '"MaShanZheng", "KaiTi", "STKaiti", "楷体", serif';
+      if (captions && timeline) {
+        captions.setFamily(fontFamily);
+        captions.prepare(timeline);
+        renderAt(currentMs);
+      }
+      if ($('modeNote').textContent.includes('手写字体没加载成功')) {
+        $('modeNote').textContent = $('modeNote').textContent.replace(' 手写字体没加载成功，已回退系统楷体。', '');
+      }
+    }).catch(() => {});
+  }
   if (new URLSearchParams(location.search).has('debug')) {
     window.__ink = {
       get playing() { return playing; },
