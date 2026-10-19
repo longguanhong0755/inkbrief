@@ -1,5 +1,5 @@
 /* image2strokes 引擎跑在 Worker 里；主线程只负责 UI、场景规划和渲染 */
-importScripts('vendor/pipeline.js?v=3');
+importScripts('vendor/pipeline.js?v=4');
 
 self.onmessage = async function (e) {
   const d = e.data || {};

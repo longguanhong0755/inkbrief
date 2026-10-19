@@ -156,7 +156,7 @@ function clearPreview() {
 // ---------------- 生成 ----------------
 function newWorker() {
   if (worker) { try { worker.terminate(); } catch (e) { /* ignore */ } }
-  worker = new Worker('js/worker.js?v=3');
+  worker = new Worker('js/worker.js?v=4');
   worker.onmessage = onWorker;
   worker.onerror = (e) => {
     workerBusy = false;

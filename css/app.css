@@ -1,6 +1,7 @@
 @font-face {
   font-family: "MaShanZheng";
-  src: url("../assets/fonts/MaShanZheng-Regular.ttf") format("truetype");
+  src: url("../assets/fonts/MaShanZheng-Regular.woff2") format("woff2"),
+       url("../assets/fonts/MaShanZheng-Regular.ttf") format("truetype");
   font-display: block;
 }
 

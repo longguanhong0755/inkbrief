@@ -39,4 +39,5 @@ SOFTWARE.
   (<https://github.com/googlefonts/mashanzheng>)
 - License: SIL Open Font License 1.1
 - 完整许可证正文：`assets/fonts/OFL.txt`
-- 字体文件来源：Google Fonts（`fonts.gstatic.com`），未做子集化或修改。
+- 字体文件来源：Google Fonts（`fonts.gstatic.com`），未做子集化或字形修改。
+- `assets/fonts/MaShanZheng-Regular.woff2` 由同目录 TTF 无损转码（仅格式转换），`@font-face` 优先加载 WOFF2，TTF 作兼容兜底。
