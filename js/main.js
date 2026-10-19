@@ -59,6 +59,7 @@ function updateCounts() {
   $('charInfo').textContent = `${ps.reduce((a, s) => a + [...s].length, 0)} 字`;
   $('go').disabled = !imgCanvas || ps.length === 0 || ps.length > MAX_SEG;
   if (ps.length > MAX_SEG) showMsg(`最多 ${MAX_SEG} 段，请把后面的并进上一段。`);
+  else if ($('msg').textContent.startsWith('最多')) hideMsg();
 }
 
 // ---------------- 图片 ----------------
