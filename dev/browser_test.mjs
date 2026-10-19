@@ -178,7 +178,7 @@ async function gen(page) {
 {
   const errs = [];
   const { ctx, page } = await newPage({ width: 1280, height: 900 }, {
-    route: '**/MaShanZheng-Regular.ttf',
+    route: /MaShanZheng-Regular\.(woff2|ttf)$/,
     routeHandler: (route) => route.abort(),
   });
   page.on('console', (m) => { if (m.type() === 'error') errs.push(m.text()); });
