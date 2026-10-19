@@ -138,6 +138,7 @@ function showEmpty(title, sub) {
 function clearPreview() {
   stop();
   currentMs = 0;
+  $('play').textContent = '播放';
   $('play').disabled = true;
   $('seek').disabled = true;
   $('export').disabled = true;
@@ -361,6 +362,18 @@ function drawMap() {
   const s = Math.min((w - pad * 2) / W, (h - pad * 2) / H);
   const ox = (w - W * s) / 2, oy = (h - H * s) / 2;
   const M = timeline.scenes.length;
+  if (plan && plan.mode === 'flat') {
+    ctx.fillStyle = '#efe8db';
+    ctx.fillRect(ox, oy, W * s, H * s);
+    ctx.strokeStyle = '#c9bfae';
+    ctx.strokeRect(ox + .5, oy + .5, W * s - 1, H * s - 1);
+    ctx.fillStyle = '#6f6759';
+    ctx.font = '600 13px -apple-system, "Segoe UI", sans-serif';
+    ctx.fillText('整图播放（字幕按段换）', ox + 12, oy + 24);
+    $('mapInfo').innerHTML = `<div>这张图分不出干净的区块：整张图连续画完，字幕按段换。</div>` +
+      timeline.scenes.map((sc, i) => `<div><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#c9bfae;margin-right:6px"></span>第 ${i + 1} 段 · ${((sc.end - sc.start) / 1000).toFixed(1)} 秒<br><span style="color:#8f8677">${sc.paragraphs.map((p) => p.text).join(' / ')}</span></div>`).join('');
+    return;
+  }
   timeline.scenes.forEach((sc, i) => {
     const b = sc.bbox;
     const x0 = clamp(b[0], 0, W), y0 = clamp(b[1], 0, H);
