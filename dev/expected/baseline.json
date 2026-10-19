@@ -1,0 +1,46 @@
+{
+  "generated": "2026-10-19T10:50:26.525Z",
+  "items": {
+    "illustration": {
+      "strokes": 2476,
+      "mode": "zones",
+      "scenes": 4,
+      "sceneStrokeCounts": [
+        833,
+        398,
+        434,
+        811
+      ],
+      "totalMs": 25545,
+      "inversions": 0,
+      "maxShare": 0.336
+    },
+    "poster": {
+      "strokes": 15688,
+      "mode": "zones",
+      "scenes": 4,
+      "sceneStrokeCounts": [
+        1113,
+        973,
+        2212,
+        11390
+      ],
+      "totalMs": 94342,
+      "inversions": 0,
+      "maxShare": 0.726
+    },
+    "photo": {
+      "strokes": 15416,
+      "mode": "flat",
+      "scenes": 3,
+      "sceneStrokeCounts": [
+        5138,
+        5139,
+        5139
+      ],
+      "totalMs": 81146,
+      "inversions": 0,
+      "maxShare": 0.333
+    }
+  }
+}

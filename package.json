@@ -1,0 +1,16 @@
+{
+  "name": "inkbrief",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "图片 + 分段文案 → 手绘讲解视频（纯前端，导出 WebM）",
+  "license": "MIT",
+  "scripts": {
+    "start": "python -m http.server 8000",
+    "test": "node dev/regress.mjs",
+    "test:order": "node dev/order_check.mjs",
+    "test:timeline": "node dev/timeline_check.mjs",
+    "test:subtitle": "node dev/subtitle_layout.mjs",
+    "test:scene": "node dev/scene_map.mjs"
+  }
+}

@@ -1,0 +1,4 @@
+dev/.cache/
+dev/out/
+*.bak
+.DS_Store
