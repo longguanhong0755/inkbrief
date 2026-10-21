@@ -280,6 +280,16 @@ export function createTimelineView(o) {
   const onResize = () => render();
   window.addEventListener('resize', onResize);
 
+  // 时间轴的实际高度写进 CSS 变量：窄屏下抽屉要贴着它上沿浮，
+  // 硬编码一个像素数会在内容变化时错位。
+  if (typeof ResizeObserver !== 'undefined') {
+    const ro = new ResizeObserver(() => {
+      const h = Math.round(root.getBoundingClientRect().height);
+      document.documentElement.style.setProperty('--tl-h', h + 'px');
+    });
+    ro.observe(root);
+  }
+
   return {
     render,
     /** 只挪播放头（播放时每帧调，不重建 DOM、不重排） */

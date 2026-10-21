@@ -11,6 +11,7 @@ import { buildSoundtrack, toAudioBuffer } from './audio/mix.js';
 import { exportVideo, downloadBlob, pickMime } from './core/exporter.js';
 import { makeDraggable, resolveDrop, applyDrop } from './ui/dragdrop.js';
 import { createTimelineView } from './ui/timeline-view.js';
+import { createScenePanel } from './ui/scene-panel.js';
 
 const $ = (id) => document.getElementById(id);
 const MAX_SEGS = 12;
@@ -42,6 +43,7 @@ const state = {
   mix: null,
   fontOk: false,
   unbound: 0,
+  selectedSeg: null,      // 场景设置栏当前针对哪一段
 };
 
 let worker = null;
@@ -50,6 +52,10 @@ const pendingJobs = new Map();
 let compositor = null;
 let painter = null;
 let timelineView = null;
+let scenePanel = null;
+// 场景栏正在自己编辑（打字、拖滑块）时，别重画它——否则输入框会失焦。
+// 由场景栏的回调置位，rebuild/renderSegs 读它来决定要不要跳过面板重绘。
+let panelEditing = false;
 const stage = $('stage');
 
 // ── 小工具 ────────────────────────────────────────────
@@ -74,6 +80,7 @@ async function boot() {
   ensureCanvas();
   initWorker();
   initTimelineView();
+  initScenePanel();
 
   const engine = new TTSEngine();
   state.tts = engine;
@@ -327,13 +334,12 @@ function handleAssetDrop(payload, ctx) {
 
 /**
  * 造一段（Scene）。
- * 源字段是 imageIds / weights / paragraphs / mode；
+ * 源字段是 imageIds / weights / paragraphs；
  * assetId 与 text 用 getter 派生，避免两份真相走偏。
  */
 function makeSeg(init = {}) {
   const seg = {
     id: init.id || uid(),
-    mode: init.mode || 'single',          // single | multiImage | multiCaption
     imageIds: init.imageIds ? [...init.imageIds] : [],
     weights: init.weights ? [...init.weights] : [],
     paragraphs: init.paragraphs ? [...init.paragraphs] : [''],
@@ -343,6 +349,20 @@ function makeSeg(init = {}) {
     capPos: init.capPos || 'bottom',      // bottom | lower | upper
   };
   if (!seg.weights.length) seg.weights = seg.imageIds.map(() => 1);
+  // mode 只是给人看的标签：多图和多字幕是**两个正交维度**，
+  // 塞进一个字段会互相覆盖（一屏既 2 图又 2 字幕时字幕会被吞掉）。
+  // 真正的判断一律看 imageIds.length / paragraphs.length。
+  Object.defineProperty(seg, 'mode', {
+    get() {
+      const multiImg = this.imageIds.length > 1;
+      const multiCap = this.paragraphs.length > 1;
+      if (multiImg && multiCap) return 'multiImage+multiCaption';
+      if (multiImg) return 'multiImage';
+      if (multiCap) return 'multiCaption';
+      return 'single';
+    },
+    enumerable: false, configurable: true,
+  });
   Object.defineProperty(seg, 'assetId', {
     get() { return this.imageIds[0] || null; },
     set(v) {
@@ -361,18 +381,24 @@ function makeSeg(init = {}) {
   return seg;
 }
 
-/** 该段的字幕分句：一屏多字幕时每句一条，否则整段一条 */
+/**
+ * 该段实际要显示的字幕句。
+ * 依据是 paragraphs 数组本身，不看 mode ——
+ * 段落数组有几项就是几句，空的（还没写）不进成片。
+ */
 function segParagraphs(seg) {
-  if (seg.mode === 'multiCaption') {
-    const list = seg.paragraphs.filter((p) => String(p).trim() !== '');
-    return list.length ? list : [''];
-  }
-  return [seg.text];
+  const raw = (seg.paragraphs || []).map(String);
+  if (raw.length <= 1) return [seg.text || ''];
+  const list = raw.filter((p) => p.trim() !== '');
+  return list.length ? list : [''];
 }
 
-/** 编辑整段文本后的落点：多字幕模式按换行切分，单字幕模式保留换行做手动断行 */
+/**
+ * 编辑整段文本后的落点：
+ * 多句（数组多于一项）时按换行切分，单句时保留换行做手动断行。
+ */
 function setSegText(seg, value) {
-  if (seg.mode === 'multiCaption') {
+  if ((seg.paragraphs || []).length > 1) {
     seg.paragraphs = String(value).split('\n');
   } else {
     seg.paragraphs = [String(value)];
@@ -432,7 +458,6 @@ function splitSegAt(segId, caret) {
   if (!a || !b) { hint('光标位置切不出两段。', 'warn'); return; }
   const next = makeSeg({ paragraphs: [b] });
   // 拆出来的后半段继承原段的图与设置
-  next.mode = seg.mode;
   next.imageIds = [...seg.imageIds];
   next.weights = [...seg.weights];
   next.capPos = seg.capPos;
@@ -456,7 +481,6 @@ function mergeSegWithPrev(segId) {
   if (!prev.imageIds.length && cur.imageIds.length) {
     prev.imageIds = [...cur.imageIds];
     prev.weights = [...cur.weights];
-    prev.mode = cur.mode;
   }
   state.segs.splice(idx, 1);
   state.renderers.clear();
@@ -474,7 +498,6 @@ function mergeSegWithNext(segId) {
   if (!next.imageIds.length && cur.imageIds.length) {
     next.imageIds = [...cur.imageIds];
     next.weights = [...cur.weights];
-    next.mode = cur.mode;
   }
   state.segs.splice(idx, 1);
   state.renderers.clear();
@@ -696,6 +719,13 @@ function renderSegs() {
       rebuild();
     });
 
+    // 点段卡空白处 = 选中这一屏（右侧场景栏跟着显示）
+    // 但点在输入框/按钮/图片上时不抢焦点，那些控件自己管
+    el.addEventListener('click', (e) => {
+      if (e.target.closest('button, input, textarea, select, .slots, .seg-bar')) return;
+      selectSeg(seg.id);
+    });
+
     box.appendChild(el);
   });
 
@@ -742,10 +772,11 @@ function setSegCaptions(segId, paragraphs, capPos = null) {
   if (!seg) return false;
   const list = (paragraphs || []).map(String);
   seg.paragraphs = list.length ? list : [''];
-  if (list.length > 1) seg.mode = 'multiCaption';
   if (capPos) seg.capPos = capPos;
-  renderSegs();
+  // 面板正在被编辑时不重画它，否则打字会失焦
+  if (!panelEditing) renderSegs();
   rebuild();
+  if (!panelEditing) scenePanel?.render();
   return true;
 }
 
@@ -764,11 +795,11 @@ function setSegImages(segId, imageIds, weights = null) {
   seg.weights = weights && weights.length === ids.length
     ? weights.map((w) => Math.max(0.05, Number(w) || 1))
     : ids.map(() => 1);
-  if (ids.length > 1) seg.mode = 'multiImage';
   state.renderers.clear();
-  renderThumbs();
-  renderSegs();
+  if (!panelEditing) renderThumbs();
+  if (!panelEditing) renderSegs();
   rebuild();
+  if (!panelEditing) scenePanel?.render();
   return true;
 }
 
@@ -944,6 +975,7 @@ function rebuild() {
 
   renderChips();
   timelineView?.render();
+  if (!panelEditing) scenePanel?.render();
   state.ms = Math.min(state.ms, state.timeline.totalMs);
   renderAt(state.ms);
   updateTransport();
@@ -982,8 +1014,7 @@ function initTimelineView() {
       updateTransport();
     },
     onSelect: (segId) => {
-      state.selectedSeg = segId;
-      highlightSegCard(segId);
+      selectSeg(segId);
     },
     onReorder: (from, to) => {
       // 时间轴上的屏序 = state.segs 的序（未配图的段不出片，不在时间轴里）
@@ -1008,6 +1039,21 @@ function initTimelineView() {
   });
 }
 
+/**
+ * 选中某一段：时间轴、段卡、右侧场景栏三处同步。
+ * 这是唯一的「选中」入口，避免三边各记一份状态走偏。
+ */
+function selectSeg(segId) {
+  state.selectedSeg = segId;
+  highlightSegCard(segId);
+  timelineView?.setSelected(segId);
+  scenePanel?.render();
+  // 窄屏下场景栏是抽屉，选中了才弹出来
+  if (segId && window.matchMedia('(max-width: 1400px)').matches) {
+    scenePanel?.setOpen(true);
+  }
+}
+
 /** 选中某段时，段卡上也高亮一下 */
 function highlightSegCard(segId) {
   document.querySelectorAll('.seg.sel').forEach((e) => e.classList.remove('sel'));
@@ -1017,6 +1063,49 @@ function highlightSegCard(segId) {
     card.classList.add('sel');
     card.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
   }
+}
+
+// ── 右侧场景设置栏 ──────────────────────────────────
+function initScenePanel() {
+  const el = $('scenePanel');
+  if (!el) return;
+  scenePanel = createScenePanel({
+    root: el,
+    state,
+    getSeg: () => state.segs.find((s) => s.id === state.selectedSeg) || null,
+    getScene: () => {
+      const tl = state.timeline;
+      if (!tl) return null;
+      return tl.scenes.find((s) => s.id === state.selectedSeg) || null;
+    },
+    onImages: (segId, imageIds, weights) => {
+      // 走统一入口，保证段卡、素材缩略图、时间轴三处一起刷新
+      setSegImages(segId, imageIds, weights);
+    },
+    onCaptions: (segId, paragraphs, capPos) => {
+      setSegCaptions(segId, paragraphs, capPos);
+    },
+    onDuration: (segId, ms) => {
+      const seg = state.segs.find((s) => s.id === segId);
+      if (!seg) return;
+      seg.manualMs = ms == null ? null : Math.round(ms);
+      rebuild();
+      renderSegs();
+      scenePanel?.render();
+    },
+    onVoice: (segId) => {
+      const seg = state.segs.find((s) => s.id === segId);
+      if (seg) genVoice(seg);
+    },
+    onSeek: (ms) => {
+      pause();
+      state.ms = ms;
+      renderAt(state.ms);
+      updateTransport();
+    },
+    // 用户正在面板里打字/拖滑块时，别把面板重画了（会失焦）
+    onEditingChange: (editing) => { panelEditing = editing; },
+  });
 }
 
 // ── 渲染 ──────────────────────────────────────────────
