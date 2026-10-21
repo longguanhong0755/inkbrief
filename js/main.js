@@ -9,6 +9,7 @@ import {
 import { TTSEngine, VOICES, loadModel } from './tts/engine.js?v=8';
 import { buildSoundtrack, toAudioBuffer } from './audio/mix.js';
 import { exportVideo, downloadBlob, pickMime } from './core/exporter.js';
+import { makeDraggable, resolveDrop, applyDrop } from './ui/dragdrop.js';
 
 const $ = (id) => document.getElementById(id);
 const MAX_SEGS = 12;
@@ -262,6 +263,13 @@ function renderThumbs() {
       e.preventDefault();
       reorderAssets(i, i + 1);
     });
+    // 拖拽源：把这张图拖到段卡上
+    makeDraggable(d, {
+      getPayload: () => ({ kind: 'asset', assetId: a.id, name: a.name, index: i }),
+      ghostLabel: `图 ${i + 1}`,
+      badgeOf: (target) => dropBadge(target, i + 1),
+      onDrop: (payload, ctx) => handleAssetDrop(payload, ctx),
+    });
     box.appendChild(d);
   });
   $('assetHint').textContent = state.assets.length
@@ -270,6 +278,46 @@ function renderThumbs() {
   $('dropText').innerHTML = state.assets.length
     ? '继续添加图片<br><small>可一次多选</small>'
     : '拖入图片，或点这里选择<br><small>可一次多选，顺序即出场顺序</small>';
+}
+
+/** ghost 上显示的落点提示 */
+function dropBadge(zone, assetNo, pt = {}) {
+  const segEl = zone?.closest?.('[data-segid]') || zone;
+  if (!segEl) return '';
+  const seg = state.segs.find((s) => s.id === segEl.dataset.segid);
+  if (!seg) return '';
+  const idx = segIndexOf(seg) + 1;
+  const slot = pt.under?.closest?.('[data-slot-index]');
+  if (slot) {
+    const i = Number(slot.dataset.slotIndex);
+    const r = slot.getBoundingClientRect();
+    const x = pt.x ?? r.left + r.width / 2;
+    const left = x < r.left + r.width / 2;
+    return left ? `→ 第${idx}段·图${i}前面` : `→ 第${idx}段·图${i}后面`;
+  }
+  return `→ 第${idx}段·追加`;
+}
+
+function segIndexOf(seg) {
+  return state.segs.findIndex((s) => s.id === seg.id);
+}
+
+/** 把图拖到段卡上：按落点规则插入 / 追加 / 替换 */
+function handleAssetDrop(payload, ctx) {
+  if (!payload || payload.kind !== 'asset') return;
+  const zone = ctx.target;
+  const segEl = zone?.closest?.('[data-segid]') || zone;
+  if (!segEl) return;
+  const seg = state.segs.find((s) => s.id === segEl.dataset.segid);
+  if (!seg) return;
+
+  const drop = resolveDrop(zone, ctx.under, ctx.x);
+  const ids = applyDrop(seg, payload.assetId, drop, ctx.alt);
+  if (ids.length === seg.imageIds.length && ids.every((v, i) => v === seg.imageIds[i])) return;
+  setSegImages(seg.id, ids);
+  const op = ctx.alt && drop.slotIndex != null ? '替换'
+    : drop.op === 'insert' ? '插入' : '追加';
+  hint(`已${op}「图 ${payload.index + 1}」到第 ${segIndexOf(seg) + 1} 段。`, 'info');
 }
 
 // ── 文案 ──────────────────────────────────────────────
@@ -496,7 +544,7 @@ function segSlotsHtml(seg) {
     const n = state.assets.indexOf(a) + 1;
     const w = seg.weights[i] || 1;
     const wTxt = seg.imageIds.length > 1 ? `<i class="w">${w % 1 === 0 ? w : w.toFixed(1)}</i>` : '';
-    return `<span class="slot" data-slot="${i}" title="图 ${n}（点一下换下一张，× 移除）">
+    return `<span class="slot" data-slot-index="${i}" data-segid="${seg.id}" title="图 ${n}（点一下换下一张，× 移除）">
       <img src="${a.url}" alt=""><b>${n}</b>${wTxt}<button class="x" data-x="${i}" title="移除">×</button>
     </span>`;
   }).join('');
@@ -518,6 +566,8 @@ function renderSegs() {
     const asset = state.assets.find((a) => a.id === seg.assetId);
     const el = document.createElement('div');
     el.className = 'seg' + (asset ? '' : ' unbound');
+    el.dataset.segid = seg.id;
+    el.dataset.dropAccept = 'seg';
 
     const audioPill = seg.status === 'busy'
       ? '<span class="pill">生成中…</span>'
@@ -596,7 +646,23 @@ function renderSegs() {
           return;
         }
         const s = e.target.closest('.slot');
-        if (s && !s.classList.contains('ghost')) cycleAsset(seg, Number(s.dataset.slot));
+        if (s && !s.classList.contains('ghost')) cycleAsset(seg, Number(s.dataset.slotIndex));
+      });
+
+      // 槽位也是拖拽源：拖到同段另一个槽位 = 调整这一屏里图的先后
+      slots.querySelectorAll('.slot[data-slot-index]').forEach((slotEl) => {
+        const si = Number(slotEl.dataset.slotIndex);
+        makeDraggable(slotEl, {
+          getPayload: () => ({
+            kind: 'asset',
+            assetId: seg.imageIds[si],
+            index: state.assets.findIndex((a) => a.id === seg.imageIds[si]),
+            sourceSegId: seg.id,
+          }),
+          ghostLabel: `图 ${state.assets.findIndex((a) => a.id === seg.imageIds[si]) + 1}`,
+          badgeOf: (zone, payload, pt) => dropBadge(zone, payload.index + 1, pt),
+          onDrop: (payload, ctx) => handleAssetDrop(payload, ctx),
+        });
       });
     }
 
