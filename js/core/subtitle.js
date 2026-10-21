@@ -135,11 +135,17 @@ export class CaptionPainter {
     };
   }
 
-  layout(key, text) {
-    let lay = this.layouts.get(key);
+  /**
+   * 排版并缓存。box 可逐屏变化（字幕位置三档），
+   * 所以缓存键里必须带上框的位置，否则换位置后会画到旧框里。
+   */
+  layout(key, text, box) {
+    const b = box || this.box;
+    const ck = `${key}@${b.x},${b.y},${b.w},${b.h}`;
+    let lay = this.layouts.get(ck);
     if (!lay) {
-      lay = layoutText(text || '', this.box, (ch, size) => this.measureFor(size)(ch));
-      this.layouts.set(key, lay);
+      lay = layoutText(text || '', b, (ch, size) => this.measureFor(size)(ch));
+      this.layouts.set(ck, lay);
     }
     return lay;
   }
@@ -149,11 +155,11 @@ export class CaptionPainter {
   /**
    * 直接画到目标 ctx。
    * @param {CanvasRenderingContext2D} ctx
-   * @param {{key:string,text:string,reveal:number,alpha:number}} p
+   * @param {{key:string,text:string,reveal:number,alpha:number,box?:object}} p
    */
   draw(ctx, p) {
     if (!p || !p.text || p.alpha <= 0) return;
-    const lay = this.layout(p.key, p.text);
+    const lay = this.layout(p.key, p.text, p.box);
     const chars = [];
     for (const line of lay.lines) for (const c of line.chars) chars.push(c);
     const n = chars.length;

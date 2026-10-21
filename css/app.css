@@ -118,6 +118,20 @@ button.link {
 .thumb:hover .del { opacity: 1; }
 .thumb.used { outline: 2px solid var(--accent); outline-offset: -1px; }
 
+/* 素材排序：拖拽在 Phase 2，先用按钮把能力露出来 */
+.thumb .mv {
+  position: absolute; left: 3px; bottom: 3px; display: flex; gap: 2px;
+  opacity: 0; transition: .15s;
+}
+.thumb:hover .mv { opacity: 1; }
+.thumb .mv button {
+  width: 18px; height: 18px; border: 0; border-radius: 5px; padding: 0;
+  background: rgba(44,43,40,.7); color: #fff; font-size: 12px; line-height: 1;
+  display: grid; place-items: center; cursor: pointer;
+}
+.thumb .mv button:hover { background: var(--accent); }
+.thumb .mv button:disabled { opacity: .35; cursor: not-allowed; }
+
 .hint { margin: 10px 0 0; color: var(--muted); font-size: 11.5px; line-height: 1.6; }
 
 /* 未配图段的汇总提示：必须在导出前让人看见 */
@@ -137,7 +151,12 @@ button.link {
   background: #fff; line-height: 1.65; font-size: 13px;
 }
 .raw textarea:focus { outline: 2px solid rgba(196,85,59,.22); border-color: var(--accent); }
-.raw button { justify-self: start; font-size: 12.5px; padding: 6px 12px; }
+.raw-actions { display: flex; align-items: center; gap: 8px; }
+.raw-actions select {
+  font-size: 12.5px; padding: 5px 8px; border: 1px solid var(--line);
+  border-radius: 7px; background: #fff; color: var(--ink);
+}
+.raw-actions button { font-size: 12.5px; padding: 6px 12px; }
 
 .segs { display: grid; gap: 9px; margin-top: 12px; }
 .empty { color: var(--muted); font-size: 12.5px; margin: 4px 0; }
@@ -181,6 +200,40 @@ button.link {
 .speed { display: flex; align-items: center; gap: 6px; margin-left: auto; font-size: 11.5px; color: var(--muted); }
 .speed input[type=range] { width: 96px; accent-color: var(--accent); }
 .speed .val { font-variant-numeric: tabular-nums; min-width: 52px; text-align: right; color: var(--ink); }
+
+/* 段内的图片槽位：一屏多图时并排显示 */
+.slots { display: flex; flex-wrap: wrap; gap: 6px; }
+.slots:empty { display: none; }
+.slot {
+  position: relative; width: 44px; height: 44px; border-radius: 8px; overflow: hidden;
+  border: 1px solid var(--line); background: #fff; cursor: pointer;
+  display: block;
+}
+.slot img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.slot b {
+  position: absolute; left: 0; bottom: 0; font-size: 10px; font-weight: 600;
+  background: rgba(0,0,0,.55); color: #fff; padding: 0 4px; border-radius: 0 6px 0 0;
+}
+.slot .w {
+  position: absolute; right: 2px; top: 2px; font-size: 9.5px; font-style: normal;
+  background: rgba(0,0,0,.55); color: #fff; border-radius: 5px; padding: 0 4px;
+}
+.slot .x {
+  position: absolute; right: 0; top: 0; width: 16px; height: 16px; line-height: 15px;
+  border: 0; border-radius: 0 6px 0 6px; background: rgba(0,0,0,.55); color: #fff;
+  font-size: 12px; padding: 0; cursor: pointer;
+}
+.slot .x:hover { background: var(--accent); }
+.slot.ghost {
+  display: grid; place-items: center; color: var(--accent);
+  border-color: #e6b9ad; background: #fdf7f4; font-size: 15px;
+}
+
+/* 段操作栏 */
+.seg-ops { display: flex; flex-wrap: wrap; gap: 5px; }
+.seg-ops .op { font-size: 11.5px; padding: 3px 8px; }
+.seg-ops .op:disabled { opacity: .4; cursor: not-allowed; }
+.seg-ops .op.danger { color: var(--accent); border-color: #e6b9ad; }
 
 /* ── 预览 ───────────────────────────────────── */
 .stage-wrap {

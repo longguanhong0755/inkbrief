@@ -1,26 +1,40 @@
 // 合成：纸面 + 图片卡 + 已画笔触 + 字幕。输出固定 W×H（横屏 1920x1080 / 竖屏 1080x1920）。
 
-export function computeLayout(W, H) {
+/**
+ * 字幕位置三档：
+ *   bottom 贴底（默认，横屏在下方安全区）
+ *   lower  抬高一点，给底部留出更多画面
+ *   upper  放到画面上部（适合竖屏，底部留给平台 UI）
+ */
+export function computeLayout(W, H, opts = {}) {
   const portrait = H > W;
+  const capPos = opts.capPos || 'bottom';
   const margin = Math.round(W * (portrait ? 0.046 : 0.032));
   const capH = Math.round(H * (portrait ? 0.125 : 0.148));
   const capY = H - margin - capH;
   const top = Math.round(H * (portrait ? 0.038 : 0.036));
   const gap = Math.round(H * 0.022);
-  const area = {
-    x: margin,
-    y: top,
-    w: W - margin * 2,
-    h: capY - top - gap,
-  };
   const capPad = Math.round(W * 0.022);
-  const cap = {
-    x: margin + capPad,
-    y: capY,
-    w: W - margin * 2 - capPad * 2,
-    h: capH,
-  };
-  return { portrait, margin, area, cap };
+  const capW = W - margin * 2 - capPad * 2;
+
+  let capBox;
+  if (capPos === 'upper') {
+    // 字幕在上方，画面下移
+    const c = { x: margin + capPad, y: top, w: capW, h: capH };
+    const a = { x: margin, y: top + capH + gap, w: W - margin * 2, h: H - margin - (top + capH + gap) };
+    capBox = { cap: c, area: a };
+  } else if (capPos === 'lower') {
+    // 字幕比贴底高一些
+    const lift = Math.round(H * 0.11);
+    const c = { x: margin + capPad, y: capY - lift, w: capW, h: capH };
+    const a = { x: margin, y: top, w: W - margin * 2, h: c.y - top - gap };
+    capBox = { cap: c, area: a };
+  } else {
+    const a = { x: margin, y: top, w: W - margin * 2, h: capY - top - gap };
+    capBox = { cap: { x: margin + capPad, y: capY, w: capW, h: capH }, area: a };
+  }
+
+  return { portrait, margin, capPos, area: capBox.area, cap: capBox.cap };
 }
 
 /** 把 sw×sh 的图按 contain 放进 area */
@@ -111,7 +125,8 @@ export class Compositor {
    */
   draw(o) {
     const { ctx } = this.begin();
-    const { area } = this.layout;
+    // 每屏的字幕位置可能不同（bottom/lower/upper），所以允许外部传入该屏的版式
+    const { area } = o.layout || this.layout;
     const box = fitInto(o.imgW || 1600, o.imgH || 1000, area);
 
     // 图卡：白底 + 投影 + 细边

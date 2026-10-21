@@ -4,6 +4,7 @@ import { Compositor, computeLayout } from './core/compositor.js';
 import { CaptionPainter } from './core/subtitle.js';
 import {
   buildTimeline, sceneAt, drawProgress, estimateDurationMs,
+  itemAt, captionAt,
 } from './core/timeline.js';
 import { TTSEngine, VOICES, loadModel } from './tts/engine.js?v=8';
 import { buildSoundtrack, toAudioBuffer } from './audio/mix.js';
@@ -240,16 +241,26 @@ function renderThumbs() {
   const box = $('thumbs');
   box.innerHTML = '';
   state.assets.forEach((a, i) => {
-    const used = state.segs.some((s) => s.assetId === a.id);
+    const used = state.segs.some((s) => s.imageIds.includes(a.id));
     const d = document.createElement('div');
     d.className = 'thumb' + (used ? ' used' : '');
-    d.innerHTML = `<img src="${a.url}" alt=""><span class="no">${i + 1}</span><button class="del" title="移除">×</button>`;
+    d.innerHTML = `<img src="${a.url}" alt=""><span class="no">${i + 1}</span>
+      <span class="mv">
+        <button class="up" title="往前挪" ${i === 0 ? 'disabled' : ''}>‹</button>
+        <button class="dn" title="往后挪" ${i === state.assets.length - 1 ? 'disabled' : ''}>›</button>
+      </span>
+      <button class="del" title="移除">×</button>`;
     d.querySelector('.del').addEventListener('click', (e) => {
       e.preventDefault();
-      state.assets = state.assets.filter((x) => x.id !== a.id);
-      for (const s of state.segs) if (s.assetId === a.id) s.assetId = null;
-      state.renderers.clear();
-      renderThumbs(); renderSegs(); rebuild();
+      removeAsset(a.id);
+    });
+    d.querySelector('.up').addEventListener('click', (e) => {
+      e.preventDefault();
+      reorderAssets(i, i - 1);
+    });
+    d.querySelector('.dn').addEventListener('click', (e) => {
+      e.preventDefault();
+      reorderAssets(i, i + 1);
     });
     box.appendChild(d);
   });
@@ -262,34 +273,211 @@ function renderThumbs() {
 }
 
 // ── 文案 ──────────────────────────────────────────────
-function splitScript() {
+
+/**
+ * 造一段（Scene）。
+ * 源字段是 imageIds / weights / paragraphs / mode；
+ * assetId 与 text 用 getter 派生，避免两份真相走偏。
+ */
+function makeSeg(init = {}) {
+  const seg = {
+    id: init.id || uid(),
+    mode: init.mode || 'single',          // single | multiImage | multiCaption
+    imageIds: init.imageIds ? [...init.imageIds] : [],
+    weights: init.weights ? [...init.weights] : [],
+    paragraphs: init.paragraphs ? [...init.paragraphs] : [''],
+    audio: init.audio || null,
+    status: init.status || 'idle',
+    manualMs: init.manualMs ?? null,
+    capPos: init.capPos || 'bottom',      // bottom | lower | upper
+  };
+  if (!seg.weights.length) seg.weights = seg.imageIds.map(() => 1);
+  Object.defineProperty(seg, 'assetId', {
+    get() { return this.imageIds[0] || null; },
+    set(v) {
+      if (v == null || v === '') this.imageIds = [];
+      else if (this.imageIds.length) this.imageIds[0] = v;
+      else this.imageIds = [v];
+      if (this.weights.length !== this.imageIds.length) this.weights = this.imageIds.map(() => 1);
+    },
+    enumerable: false, configurable: true,
+  });
+  Object.defineProperty(seg, 'text', {
+    get() { return this.paragraphs.join('\n'); },
+    set(v) { this.paragraphs = [String(v ?? '')]; },
+    enumerable: false, configurable: true,
+  });
+  return seg;
+}
+
+/** 该段的字幕分句：一屏多字幕时每句一条，否则整段一条 */
+function segParagraphs(seg) {
+  if (seg.mode === 'multiCaption') {
+    const list = seg.paragraphs.filter((p) => String(p).trim() !== '');
+    return list.length ? list : [''];
+  }
+  return [seg.text];
+}
+
+/** 编辑整段文本后的落点：多字幕模式按换行切分，单字幕模式保留换行做手动断行 */
+function setSegText(seg, value) {
+  if (seg.mode === 'multiCaption') {
+    seg.paragraphs = String(value).split('\n');
+  } else {
+    seg.paragraphs = [String(value)];
+  }
+}
+
+/** 分段规则：auto（先按空行，空行切不动就按句）/ blank / line / sentence */
+const SPLIT_RULES = {
+  auto(raw) {
+    let parts = raw.split(/\n\s*\n+/).map((s) => s.replace(/\s+/g, ' ').trim()).filter(Boolean);
+    if (parts.length === 1) {
+      const sents = raw.split(/(?<=[。！？])/).map((s) => s.trim()).filter(Boolean);
+      if (sents.length > 1 && sents.length <= MAX_SEGS) parts = sents;
+    }
+    return parts;
+  },
+  blank(raw) {
+    return raw.split(/\n\s*\n+/).map((s) => s.replace(/\s+/g, ' ').trim()).filter(Boolean);
+  },
+  line(raw) {
+    return raw.split(/\n+/).map((s) => s.trim()).filter(Boolean);
+  },
+  sentence(raw) {
+    return raw.split(/(?<=[。！？])/).map((s) => s.trim()).filter(Boolean);
+  },
+};
+
+function splitScript(rule = 'auto') {
   const raw = $('rawScript').value.trim();
   if (!raw) { hint('先把文案粘进来。', 'warn'); return; }
-  let parts = raw.split(/\n\s*\n+/).map((s) => s.replace(/\s+/g, ' ').trim()).filter(Boolean);
-  if (parts.length === 1) {
-    const sents = raw.split(/(?<=[。！？])/).map((s) => s.trim()).filter(Boolean);
-    if (sents.length > 1 && sents.length <= MAX_SEGS) parts = sents;
-  }
+  const fn = SPLIT_RULES[rule] || SPLIT_RULES.auto;
+  let parts = fn(raw);
+  if (!parts.length) { hint('这段文案切不出内容。', 'warn'); return; }
   if (parts.length > MAX_SEGS) {
     const head = parts.slice(0, MAX_SEGS - 1);
     const rest = parts.slice(MAX_SEGS - 1).join(' ');
     parts = [...head, rest];
     hint(`超过 ${MAX_SEGS} 段，后面几段已合并到最后一段。`, 'warn');
   }
-  state.segs = parts.map((text) => ({
-    id: uid(), text, assetId: null, audio: null, status: 'idle', manualMs: null,
-  }));
+  state.segs = parts.map((text) => makeSeg({ paragraphs: [text] }));
   state.renderers.clear();
   autoBind();
   renderSegs();
   rebuild();
   refreshGenButton();
 }
+/** 在光标处把一段拆成两段 */
+function splitSegAt(segId, caret) {
+  const idx = state.segs.findIndex((s) => s.id === segId);
+  if (idx < 0) return;
+  const seg = state.segs[idx];
+  const text = seg.text;
+  const at = Math.max(0, Math.min(text.length, Number(caret) || 0));
+  if (at <= 0 || at >= text.length) { hint('把光标放到要拆开的位置。', 'warn'); return; }
+  const a = text.slice(0, at).trim();
+  const b = text.slice(at).trim();
+  if (!a || !b) { hint('光标位置切不出两段。', 'warn'); return; }
+  const next = makeSeg({ paragraphs: [b] });
+  // 拆出来的后半段继承原段的图与设置
+  next.mode = seg.mode;
+  next.imageIds = [...seg.imageIds];
+  next.weights = [...seg.weights];
+  next.capPos = seg.capPos;
+  seg.paragraphs = [a];
+  seg.imageIds = [];
+  seg.weights = [];
+  state.segs.splice(idx + 1, 0, next);
+  state.renderers.clear();
+  renderSegs();
+  rebuild();
+}
+
+/** 把一段并到上一段 */
+function mergeSegWithPrev(segId) {
+  const idx = state.segs.findIndex((s) => s.id === segId);
+  if (idx <= 0) { hint('第一段没法再往上并了。', 'warn'); return; }
+  const prev = state.segs[idx - 1];
+  const cur = state.segs[idx];
+  prev.paragraphs = [...segParagraphs(prev), ...segParagraphs(cur)];
+  // 上一段没图就把这一段的图接过去
+  if (!prev.imageIds.length && cur.imageIds.length) {
+    prev.imageIds = [...cur.imageIds];
+    prev.weights = [...cur.weights];
+    prev.mode = cur.mode;
+  }
+  state.segs.splice(idx, 1);
+  state.renderers.clear();
+  renderSegs();
+  rebuild();
+}
+
+/** 把一段并到下一段 */
+function mergeSegWithNext(segId) {
+  const idx = state.segs.findIndex((s) => s.id === segId);
+  if (idx < 0 || idx >= state.segs.length - 1) { hint('最后一段没法再往下并了。', 'warn'); return; }
+  const cur = state.segs[idx];
+  const next = state.segs[idx + 1];
+  next.paragraphs = [...segParagraphs(cur), ...segParagraphs(next)];
+  if (!next.imageIds.length && cur.imageIds.length) {
+    next.imageIds = [...cur.imageIds];
+    next.weights = [...cur.weights];
+    next.mode = cur.mode;
+  }
+  state.segs.splice(idx, 1);
+  state.renderers.clear();
+  renderSegs();
+  rebuild();
+}
+
+/** 段落重排：把 from 位置的段移到 to 位置 */
+function reorderSeg(from, to) {
+  const n = state.segs.length;
+  const f = Math.max(0, Math.min(n - 1, Number(from) | 0));
+  const t = Math.max(0, Math.min(n - 1, Number(to) | 0));
+  if (f === t) return;
+  const [item] = state.segs.splice(f, 1);
+  state.segs.splice(t, 0, item);
+  state.renderers.clear();
+  renderSegs();
+  rebuild();
+}
+
+/** 素材重排 */
+function reorderAssets(from, to) {
+  const n = state.assets.length;
+  const f = Math.max(0, Math.min(n - 1, Number(from) | 0));
+  const t = Math.max(0, Math.min(n - 1, Number(to) | 0));
+  if (f === t) return;
+  const [item] = state.assets.splice(f, 1);
+  state.assets.splice(t, 0, item);
+  renderThumbs();
+  renderSegs();
+  rebuild();
+}
+
+/** 删一张图：引用它的段会变成未配图（有汇总提示，不会静默吞掉） */
+function removeAsset(assetId) {
+  const a = state.assets.find((x) => x.id === assetId);
+  if (!a) return;
+  state.assets = state.assets.filter((x) => x.id !== assetId);
+  for (const s of state.segs) {
+    const i = s.imageIds.indexOf(assetId);
+    if (i >= 0) s.imageIds.splice(i, 1);
+    if (s.weights.length === s.imageIds.length) s.weights = s.imageIds.map(() => 1);
+  }
+  state.renderers.clear();
+  renderThumbs();
+  renderSegs();
+  rebuild();
+}
 
 function autoBind() {
   state.segs.forEach((s, i) => {
-    if (s.assetId && state.assets.some((a) => a.id === s.assetId)) return;
-    s.assetId = state.assets.length ? state.assets[Math.min(i, state.assets.length - 1)].id : null;
+    if (s.imageIds.length && s.imageIds.every((id) => state.assets.some((a) => a.id === id))) return;
+    s.imageIds = state.assets.length ? [state.assets[Math.min(i, state.assets.length - 1)].id] : [];
+    s.weights = s.imageIds.map(() => 1);
   });
 }
 
@@ -298,6 +486,21 @@ function segDuration(seg) {
   if (manual > 0) return Math.round(manual);
   if (seg.audio && seg.audio.duration) return Math.round(seg.audio.duration * 1000);
   return estimateDurationMs(seg.text);
+}
+
+/** 段卡上的图片槽位：多图时并排显示，每格可删、可点着换 */
+function segSlotsHtml(seg) {
+  const cells = seg.imageIds.map((id, i) => {
+    const a = state.assets.find((x) => x.id === id);
+    if (!a) return `<span class="slot ghost" title="图已被删除">?</span>`;
+    const n = state.assets.indexOf(a) + 1;
+    const w = seg.weights[i] || 1;
+    const wTxt = seg.imageIds.length > 1 ? `<i class="w">${w % 1 === 0 ? w : w.toFixed(1)}</i>` : '';
+    return `<span class="slot" data-slot="${i}" title="图 ${n}（点一下换下一张，× 移除）">
+      <img src="${a.url}" alt=""><b>${n}</b>${wTxt}<button class="x" data-x="${i}" title="移除">×</button>
+    </span>`;
+  }).join('');
+  return `<div class="slots" data-segid="${seg.id}">${cells}</div>`;
 }
 
 function renderSegs() {
@@ -338,6 +541,7 @@ function renderSegs() {
         <span class="right">${audioPill}</span>
       </div>
       <textarea rows="2" data-segid="${seg.id}" placeholder="这一段要讲的话">${escapeHtml(seg.text)}</textarea>
+      ${segSlotsHtml(seg)}
       <div class="seg-bar">
         <button class="pick ${asset ? '' : 'none'}" type="button">
           ${asset ? `<img src="${asset.url}" alt="">图 ${state.assets.indexOf(asset) + 1}` : '选择配图'}
@@ -350,11 +554,20 @@ function renderSegs() {
           <span class="val">${(dur / 1000).toFixed(1)}s${speedTxt ? ` · ${speedTxt}` : ''}</span>
         </label>
       </div>
+      <div class="seg-ops">
+        <button class="ghost op" data-op="split" type="button" title="在光标处把这段拆成两段">拆分</button>
+        <button class="ghost op" data-op="merge-prev" type="button" ${i === 0 ? 'disabled' : ''} title="并入上一段">并入上段</button>
+        <button class="ghost op" data-op="merge-next" type="button" ${i === state.segs.length - 1 ? 'disabled' : ''} title="并入下一段">并入下段</button>
+        <button class="ghost op" data-op="up" type="button" ${i === 0 ? 'disabled' : ''} title="往前挪一段">上移</button>
+        <button class="ghost op" data-op="down" type="button" ${i === state.segs.length - 1 ? 'disabled' : ''} title="往后挪一段">下移</button>
+        <button class="ghost op" data-op="cap" type="button" title="字幕位置：贴底 / 抬高 / 置顶">字幕：${{ bottom: '贴底', lower: '抬高', upper: '置顶' }[seg.capPos]}</button>
+        <button class="ghost op danger" data-op="del" type="button" title="删掉这一段">删</button>
+      </div>
     `;
 
     const ta = el.querySelector('textarea');
     ta.addEventListener('input', () => {
-      seg.text = ta.value;
+      setSegText(seg, ta.value);
       el.querySelector('.wc').textContent = `${ta.value.replace(/\s/g, '').length} 字`;
       if (seg.audio) {
         seg.status = 'stale';
@@ -367,6 +580,43 @@ function renderSegs() {
 
     el.querySelector('.pick').addEventListener('click', () => cycleAsset(seg));
     el.querySelector('.voice-btn').addEventListener('click', () => genVoice(seg));
+
+    // 槽位：点 × 移除，点槽位本身换下一张
+    const slots = el.querySelector('.slots');
+    if (slots) {
+      slots.addEventListener('click', (e) => {
+        const x = e.target.closest('.x');
+        if (x) {
+          e.stopPropagation();
+          const i2 = Number(x.dataset.x);
+          seg.imageIds.splice(i2, 1);
+          if (seg.weights.length > seg.imageIds.length) seg.weights.splice(i2, 1);
+          state.renderers.clear();
+          renderSegs(); rebuild();
+          return;
+        }
+        const s = e.target.closest('.slot');
+        if (s && !s.classList.contains('ghost')) cycleAsset(seg, Number(s.dataset.slot));
+      });
+    }
+
+    // 段操作
+    el.querySelector('.seg-ops').addEventListener('click', (e) => {
+      const b = e.target.closest('.op');
+      if (!b) return;
+      const op = b.dataset.op;
+      if (op === 'split') splitSegAt(seg.id, ta.selectionStart);
+      else if (op === 'merge-prev') mergeSegWithPrev(seg.id);
+      else if (op === 'merge-next') mergeSegWithNext(seg.id);
+      else if (op === 'up') reorderSeg(i, i - 1);
+      else if (op === 'down') reorderSeg(i, i + 1);
+      else if (op === 'del') removeSeg(seg.id);
+      else if (op === 'cap') {
+        const order = ['bottom', 'lower', 'upper'];
+        seg.capPos = order[(order.indexOf(seg.capPos) + 1) % order.length];
+        renderSegs(); rebuild();
+      }
+    });
 
     const slider = el.querySelector('input[type=range]');
     const valEl = el.querySelector('.val');
@@ -396,7 +646,7 @@ function updateUnboundHint(unbound) {
   const el = $('unboundHint');
   if (!el) return;
   if (!unbound.length) { el.hidden = true; el.textContent = ''; return; }
-  const noAsset = unbound.filter((s) => !s.assetId).length;
+  const noAsset = unbound.filter((s) => !s.imageIds.length).length;
   const badAsset = unbound.length - noAsset;
   const parts = [];
   if (noAsset) parts.push(`${noAsset} 段没配图`);
@@ -405,10 +655,84 @@ function updateUnboundHint(unbound) {
   el.textContent = `⚠ ${parts.join('，')}，不会出现在成片里。点段落卡上的「选择配图」补上。`;
 }
 
-function cycleAsset(seg) {
+/** 删一段 */
+function removeSeg(segId) {
+  const idx = state.segs.findIndex((s) => s.id === segId);
+  if (idx < 0) return;
+  state.segs.splice(idx, 1);
+  state.renderers.clear();
+  renderSegs();
+  rebuild();
+}
+
+/**
+ * 设置某一段的字幕分句与位置。UI 与外部调用走同一入口。
+ */
+function setSegCaptions(segId, paragraphs, capPos = null) {
+  const seg = state.segs.find((s) => s.id === segId);
+  if (!seg) return false;
+  const list = (paragraphs || []).map(String);
+  seg.paragraphs = list.length ? list : [''];
+  if (list.length > 1) seg.mode = 'multiCaption';
+  if (capPos) seg.capPos = capPos;
+  renderSegs();
+  rebuild();
+  return true;
+}
+
+/**
+ * 设置某一段的图。UI 交互（拖拽）和外部调用都走这一个入口，
+ * 保证「state 改了但界面没刷新」这种事不会发生。
+ * @param {string} segId
+ * @param {string[]} imageIds
+ * @param {number[]} [weights] 与 imageIds 等长；不给则全为 1
+ */
+function setSegImages(segId, imageIds, weights = null) {
+  const seg = state.segs.find((s) => s.id === segId);
+  if (!seg) return false;
+  const ids = (imageIds || []).filter(Boolean);
+  seg.imageIds = ids;
+  seg.weights = weights && weights.length === ids.length
+    ? weights.map((w) => Math.max(0.05, Number(w) || 1))
+    : ids.map(() => 1);
+  if (ids.length > 1) seg.mode = 'multiImage';
+  state.renderers.clear();
+  renderThumbs();
+  renderSegs();
+  rebuild();
+  return true;
+}
+
+/**
+ * 换图。
+ * 不传 slotIndex：整体轮换（第一张图往后换，保持单图行为不变）。
+ * 传了 slotIndex：只换那一张。
+ */
+function cycleAsset(seg, slotIndex = null) {
   if (!state.assets.length) { hint('先加图片。', 'warn'); return; }
-  const idx = state.assets.findIndex((a) => a.id === seg.assetId);
-  seg.assetId = state.assets[(idx + 1) % state.assets.length].id;
+  if (slotIndex === null) {
+    const idx = state.assets.findIndex((a) => a.id === seg.assetId);
+    const next = state.assets[(idx + 1) % state.assets.length].id;
+    if (seg.imageIds.length <= 1) {
+      seg.imageIds = [next];
+      seg.weights = [1];
+    } else {
+      // 多图时整体轮换 = 整组往后挪一位
+      const cur = state.assets.findIndex((a) => a.id === seg.imageIds[0]);
+      const rot = seg.imageIds.map((id) => {
+        const i = state.assets.findIndex((a) => a.id === id);
+        return state.assets[(i + 1) % state.assets.length].id;
+      });
+      void cur;
+      seg.imageIds = rot;
+    }
+  } else {
+    const i = slotIndex;
+    if (i < 0 || i >= seg.imageIds.length) return;
+    const cur = state.assets.findIndex((a) => a.id === seg.imageIds[i]);
+    seg.imageIds[i] = state.assets[(cur + 1) % state.assets.length].id;
+  }
+  state.renderers.clear();
   renderThumbs(); renderSegs(); rebuild();
 }
 
@@ -433,13 +757,13 @@ async function genVoice(seg) {
 
 // ── 生成 ──────────────────────────────────────────────
 function refreshGenButton() {
-  const ok = state.segs.length > 0 && state.segs.some((s) => s.assetId);
+  const ok = state.segs.length > 0 && state.segs.some((s) => s.imageIds.length);
   $('genBtn').disabled = !ok;
 }
 
 async function generate() {
   if (state.busy) return;
-  const segs = state.segs.filter((s) => s.assetId);
+  const segs = state.segs.filter((s) => s.imageIds.length);
   if (!segs.length) { hint('每段都要先配一张图。', 'warn'); return; }
 
   state.busy = true;
@@ -448,7 +772,8 @@ async function generate() {
   genBtn.textContent = '生成中…';
 
   try {
-    const need = [...new Set(segs.map((s) => s.assetId))];
+    // 一屏多图时，每张图都要分析笔触
+    const need = [...new Set(segs.flatMap((s) => s.imageIds))];
     let done = 0;
     for (const id of need) {
       const a = state.assets.find((x) => x.id === id);
@@ -484,9 +809,10 @@ async function generate() {
 }
 
 function rebuild() {
-  const bound = state.segs.filter((s) => s.assetId && state.assets.some((a) => a.id === s.assetId));
+  // 一段只要有图就出片（多图都算）；完全没图的段不能静默吞掉
+  const bound = state.segs.filter((s) => s.imageIds.length && s.imageIds.some((id) => state.assets.some((a) => a.id === id)));
   // 没配图的段不能静默吞掉：用户以为有 8 段，实际只出 6 屏，他不知道少了什么
-  const unbound = state.segs.filter((s) => !(s.assetId && state.assets.some((a) => a.id === s.assetId)));
+  const unbound = state.segs.filter((s) => !(s.imageIds.length && s.imageIds.some((id) => state.assets.some((a) => a.id === id))));
   state.unbound = unbound.length;
   updateUnboundHint(unbound);
 
@@ -502,12 +828,28 @@ function rebuild() {
   }
 
   const mapped = bound.map((s) => {
-    const a = state.assets.find((x) => x.id === s.assetId);
+    // 已被删掉的图从这一屏里剔掉（并留警告，不静默）
+    const ids = [];
+    const weights = [];
+    s.imageIds.forEach((id, i) => {
+      if (!state.assets.some((a) => a.id === id)) return;
+      ids.push(id);
+      weights.push(Number(s.weights[i]) || 1);
+    });
+    const assets = ids.map((id) => state.assets.find((x) => x.id === id));
     return {
-      id: s.id, text: s.text, hasImage: !!a,
+      id: s.id,
+      text: s.text,
+      paragraphs: segParagraphs(s),
+      mode: s.mode,
+      capPos: s.capPos,
+      imageIds: ids,
+      weights: weights.length === ids.length ? weights : ids.map(() => 1),
+      hasImage: !!assets.length,
       audioMs: s.audio ? s.audio.duration * 1000 : 0,
       manualMs: s.manualMs,
-      strokeCount: a && a.strokes ? a.strokes.length : 0,
+      strokeCount: assets.length === 1 && assets[0].strokes ? assets[0].strokes.length : 0,
+      strokeCounts: assets.map((a) => (a.strokes ? a.strokes.length : 0)),
     };
   });
 
@@ -518,8 +860,12 @@ function rebuild() {
     sc.text = seg ? seg.text : '';
   });
 
+  // 渲染器缓存的 key 可能是 `segId`（单图）或 `segId#图片序号`（多图），按前缀清理
   const validIds = new Set(state.timeline.scenes.map((s) => s.id));
-  for (const key of [...state.renderers.keys()]) if (!validIds.has(key)) state.renderers.delete(key);
+  for (const key of [...state.renderers.keys()]) {
+    const base = String(key).split('#')[0];
+    if (!validIds.has(base)) state.renderers.delete(key);
+  }
 
   $('stageEmpty').hidden = true;
   $('playBtn').disabled = false;
@@ -576,20 +922,26 @@ function ensureCanvas() {
   }
 }
 
-function rendererFor(sc) {
-  const asset = state.assets.find((a) => a.id === sc.assetId);
+/**
+ * 渲染器缓存的键：一屏多图时每张图要独立的渲染器（笔数、抽稀比例都不同）。
+ */
+function rendererFor(sc, item) {
+  const assetId = item ? item.assetId : sc.assetId;
+  const asset = state.assets.find((a) => a.id === assetId);
   if (!asset || !asset.strokes) return null;
   const n = asset.strokes.length;
-  const keep = Math.min(n, Math.max(1, Math.round(sc.keep)));
-  let rec = state.renderers.get(sc.id);
+  const keepRaw = item ? item.keep : sc.keep;
+  const keep = Math.min(n, Math.max(1, Math.round(keepRaw)));
+  const key = item ? `${sc.id}#${item.index}` : sc.id;
+  let rec = state.renderers.get(key);
   if (rec && rec.assetId === asset.id && rec.count === n && rec.keep === keep) return rec;
 
   // 抽稀策略见 core/stroke-order.js：整块优先，不丢笔造成白斑
   const rd = StrokeRenderer.create({
     W: asset.w, H: asset.h, strokes: asset.strokes, clips: asset.clips, keep,
   });
-  rec = { rd, assetId: asset.id, count: n, keep, orderLen: rd.order.length };
-  state.renderers.set(sc.id, rec);
+  rec = { rd, assetId: asset.id, count: n, keep, orderLen: rd.order.length, key };
+  state.renderers.set(key, rec);
   return rec;
 }
 
@@ -600,20 +952,26 @@ function renderAt(ms) {
   if (!hit) return;
   const sc = hit.scene;
   const seg = state.segs.find((s) => s.id === sc.id);
-  const asset = state.assets.find((a) => a.id === sc.assetId);
+
+  // 多图：这一时刻该画哪一张
+  const cur = itemAt(sc, hit.local);
+  if (!cur) return;
+  const asset = state.assets.find((a) => a.id === cur.item.assetId);
   if (!asset) return;
 
-  const rec = rendererFor(sc);
+  const rec = rendererFor(sc, cur.item);
   let partial = null, tip = null, painted = null;
   if (rec) {
-    const p = drawProgress(sc, hit.local);
-    const pos = p * rec.orderLen;
+    const pos = cur.progress * rec.orderLen;
     const nDone = Math.floor(pos);
     rec.rd.seekTo(nDone, pos - nDone);
     partial = rec.rd.getPartial();
     tip = rec.rd.tip;
     painted = rec.rd.painted;
   }
+
+  // 每屏的字幕位置可以不同 → 版式跟着换
+  const lay = computeLayout(state.W, state.H, { capPos: sc.capPos });
 
   compositor.draw({
     bitmap: asset.el,
@@ -623,16 +981,22 @@ function renderAt(ms) {
     partial,
     tip,
     tipAlpha: hit.local < sc.drawMs ? 1 : 0,
+    layout: lay,
   });
 
-  const reveal = clamp((hit.local - 140) / Math.max(360, sc.dur * 0.7), 0, 1);
-  const alpha = clamp((hit.local + 40) / 200, 0, 1);
+  // 字幕：多句时按时间窗切换当前该显示的那句
+  const span = captionAt(sc, hit.local);
+  const capText = span ? span.text : (seg ? seg.text : '');
+  const spanStart = span ? span.start : 0;
+  const reveal = clamp((hit.local - spanStart - 140) / Math.max(360, (span ? span.dur : sc.dur) * 0.7), 0, 1);
+  const alpha = clamp((hit.local - spanStart + 40) / 200, 0, 1);
   painter.draw(compositor.ctx, {
-    key: sc.id,
-    text: seg ? seg.text : '',
+    key: `${sc.id}#${span ? span.index : 0}`,
+    text: capText,
     reveal,
     alpha,
     seed: sc.index * 37,
+    box: lay.cap,
   });
 
   const chips = $('chips').children;
@@ -793,7 +1157,7 @@ function bindUI() {
   window.addEventListener('dragover', (e) => e.preventDefault());
   window.addEventListener('drop', (e) => e.preventDefault());
 
-  $('splitBtn').addEventListener('click', splitScript);
+  $('splitBtn').addEventListener('click', () => splitScript($('splitRule')?.value || 'auto'));
   $('genBtn').addEventListener('click', generate);
   $('expBtn').addEventListener('click', doExport);
 
@@ -824,9 +1188,11 @@ if (new URLSearchParams(location.search).has('debug')) {
   window.__ink = {
     get state() { return state; },
     get timeline() { return state.timeline; },
-    renderAt, generate, play, pause,
+    renderAt, generate, play, pause, rebuild, renderSegs,
     synth: (t) => state.tts.synth(t, voiceOf()),
     addFiles, splitScript,
+    makeSeg, splitSegAt, mergeSegWithPrev, mergeSegWithNext,
+    reorderSeg, reorderAssets, removeAsset, removeSeg, cycleAsset, setSegImages, setSegCaptions,
   };
 }
 

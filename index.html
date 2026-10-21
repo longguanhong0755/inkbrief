@@ -62,7 +62,15 @@
     <h2><b>2</b> 文案与配音</h2>
     <div class="raw">
       <textarea id="rawScript" rows="4" placeholder="把整篇稿子粘进来，每段之间空一行。&#10;&#10;例如：&#10;今天聊三件事。&#10;&#10;第一，图片不要上传。"></textarea>
-      <button id="splitBtn" class="ghost">按空行分段</button>
+      <div class="raw-actions">
+        <select id="splitRule" title="怎么切分文案">
+          <option value="auto">自动分段</option>
+          <option value="blank">按空行</option>
+          <option value="line">按每行</option>
+          <option value="sentence">按每句</option>
+        </select>
+        <button id="splitBtn" class="ghost">分段</button>
+      </div>
     </div>
     <div class="segs" id="segs">
       <p class="empty">还没有分段。粘稿子后点「按空行分段」。</p>
