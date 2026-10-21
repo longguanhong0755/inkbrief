@@ -9,6 +9,7 @@ inkbrief 的绘制引擎来自 image2strokes，手写字体来自 Google Fonts�
 | image2strokes | `js/vendor/pipeline.js` | MIT |
 | onnxruntime-web | `js/vendor/ort/` | MIT |
 | pinyin-pro | `js/vendor/pinyin-pro.min.js` | MIT |
+| mp4-muxer | `js/vendor/mp4-muxer/` | MIT |
 | Piper 中文音色 zh_CN-huayan x_low | `assets/tts/` | MIT |
 | Ma Shan Zheng 字体 | `assets/fonts/` | SIL OFL 1.1 |
 | espeak-ng（**仅开发期**，不随产品分发） | — | GPL-3.0 |
@@ -54,6 +55,17 @@ SOFTWARE.
 - Source: <https://github.com/zh-lx/pinyin-pro>
 - License: MIT
 - 用途：把中文按词组转拼音（判多音字），再查音素表。
+
+## mp4-muxer（`js/vendor/mp4-muxer/mp4-muxer.mjs`）
+
+- Source: <https://github.com/Vanilagy/mp4-muxer>（v5.2.2）
+- License: MIT（完整许可证正文见 `js/vendor/mp4-muxer/LICENSE`）
+- 用途：把 WebCodecs 编码出来的 H.264 视频块和 AAC 音频块封成 MP4。
+  没有它就只能用 MediaRecorder 实时录制（慢机掉帧、音画可能错位）。
+- 文件是从 npm 包 `build/mp4-muxer.mjs` 原样拷贝，未做任何修改。
+- 上游已标注「被 Mediabunny 取代」，但本项目只需要它最基础的 MP4 封装能力，
+  且 MIT 许可比 Mediabunny 的 MPL-2.0 更宽松（文件级 copyleft vs 宽松 MIT），
+  vendored 进 MIT 项目没有额外义务。
 
 ## Piper 中文音色 zh_CN-huayan x_low（`assets/tts/zh-huayan-fp16.onnx`）
 

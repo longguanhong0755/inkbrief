@@ -8,7 +8,7 @@ import {
 } from './core/timeline.js';
 import { TTSEngine, VOICES, loadModel } from './tts/engine.js?v=8';
 import { buildSoundtrack, toAudioBuffer } from './audio/mix.js';
-import { exportVideo, downloadBlob, pickMime } from './core/exporter.js';
+import { exportVideo, exportVideoOffline, downloadBlob, pickMime, probeCodecs } from './core/exporter.js';
 import { makeDraggable, resolveDrop, applyDrop } from './ui/dragdrop.js';
 import { createTimelineView } from './ui/timeline-view.js';
 import { createScenePanel } from './ui/scene-panel.js';
@@ -1547,19 +1547,22 @@ function rendererFor(sc, item) {
   return rec;
 }
 
-function renderAt(ms) {
-  if (!state.timeline || !state.timeline.scenes.length) return;
-  ensureCanvas();
+/**
+ * 取某一时刻的「画面状态」：这一屏该画哪张图、笔触画到第几笔、字幕显示哪句。
+ * 这一步跟画幅无关 —— 竖屏和横屏用的是同一份笔触进度，所以双画幅只需算一次。
+ */
+function frameStateAt(ms) {
+  if (!state.timeline || !state.timeline.scenes.length) return null;
   const hit = sceneAt(state.timeline, ms);
-  if (!hit) return;
+  if (!hit) return null;
   const sc = hit.scene;
   const seg = state.segs.find((s) => s.id === sc.id);
 
   // 多图：这一时刻该画哪一张
   const cur = itemAt(sc, hit.local);
-  if (!cur) return;
+  if (!cur) return null;
   const asset = state.assets.find((a) => a.id === cur.item.assetId);
-  if (!asset) return;
+  if (!asset) return null;
 
   const rec = rendererFor(sc, cur.item);
   let partial = null, tip = null, painted = null;
@@ -1572,37 +1575,77 @@ function renderAt(ms) {
     painted = rec.rd.painted;
   }
 
-  // 每屏的字幕位置可以不同 → 版式跟着换
-  const lay = computeLayout(state.W, state.H, { capPos: sc.capPos });
-
-  compositor.draw({
-    bitmap: asset.el,
-    imgW: asset.w,
-    imgH: asset.h,
-    painted,
-    partial,
-    tip,
-    tipAlpha: hit.local < sc.drawMs ? 1 : 0,
-    layout: lay,
-  });
-
   // 字幕：多句时按时间窗切换当前该显示的那句
   const span = captionAt(sc, hit.local);
   const capText = span ? span.text : (seg ? seg.text : '');
   const spanStart = span ? span.start : 0;
   const reveal = clamp((hit.local - spanStart - 140) / Math.max(360, (span ? span.dur : sc.dur) * 0.7), 0, 1);
   const alpha = clamp((hit.local - spanStart + 40) / 200, 0, 1);
-  painter.draw(compositor.ctx, {
-    key: `${sc.id}#${span ? span.index : 0}`,
-    text: capText,
-    reveal,
-    alpha,
-    seed: sc.index * 37,
-    box: lay.cap,
+
+  return {
+    sc, asset, painted, partial, tip,
+    tipAlpha: hit.local < sc.drawMs ? 1 : 0,
+    capText, reveal, alpha,
+    capKey: `${sc.id}#${span ? span.index : 0}`,
+  };
+}
+
+/** 把画面状态画到某个目标（指定画幅的画布 + 合成器 + 字幕画笔） */
+function paintFrame(st, tgt) {
+  if (!st) return;
+  // 每屏的字幕位置可以不同 → 版式跟着换
+  const lay = computeLayout(tgt.W, tgt.H, { capPos: st.sc.capPos });
+
+  tgt.compositor.draw({
+    bitmap: st.asset.el,
+    imgW: st.asset.w,
+    imgH: st.asset.h,
+    painted: st.painted,
+    partial: st.partial,
+    tip: st.tip,
+    tipAlpha: st.tipAlpha,
+    layout: lay,
   });
 
+  tgt.painter.draw(tgt.compositor.ctx, {
+    key: st.capKey,
+    text: st.capText,
+    reveal: st.reveal,
+    alpha: st.alpha,
+    seed: st.sc.index * 37,
+    box: lay.cap,
+  });
+}
+
+/** 预览用的目标：舞台画布本身 */
+function stageTarget() {
+  return { W: state.W, H: state.H, canvas: stage, compositor, painter, label: `${state.W}×${state.H}` };
+}
+
+/**
+ * 导出用的目标：离屏画布（导出分辨率可能和预览不一致）。
+ * 预览画布是 DOM 上的，导出要的是真实像素尺寸，两回事。
+ */
+function makeExportTarget(W, H) {
+  const canvas = document.createElement('canvas');
+  canvas.width = W; canvas.height = H;
+  const comp = new Compositor({ W, H, canvas });
+  const pnt = new CaptionPainter({
+    W, H,
+    box: computeLayout(W, H).cap,
+    family: state.fontOk ? `"${FONT_NAME}", ${KAI}` : KAI,
+  });
+  return { W, H, canvas, compositor: comp, painter: pnt, label: `${W}×${H}` };
+}
+
+function renderAt(ms) {
+  ensureCanvas();
+  const st = frameStateAt(ms);
+  if (!st) return;
+  paintFrame(st, stageTarget());
+
   const chips = $('chips').children;
-  for (let i = 0; i < chips.length; i++) chips[i].classList.toggle('on', i === sc.index);
+  for (let i = 0; i < chips.length; i++) chips[i].classList.toggle('on', i === st.sc.index);
   // 播放头跟着走（只改 transform，不重建整条时间轴）
   timelineView?.updateHead();
 }
@@ -1683,12 +1726,29 @@ function tick() {
 }
 
 // ── 导出 ──────────────────────────────────────────────
+
+/** 要导出的画幅列表：当前画幅；勾了「同时出竖屏」就再加一路竖屏 */
+function exportViews() {
+  const views = [makeExportTarget(state.W, state.H)];
+  if ($('dualExport')?.checked) {
+    const pw = state.W > state.H ? 1080 : 1920;
+    const ph = state.W > state.H ? 1920 : 1080;
+    views.push(makeExportTarget(pw, ph));
+  }
+  return views;
+}
+
 async function doExport() {
   if (!state.timeline || !state.timeline.totalMs) return;
   if (state.busy) return;
   pause();
 
-  if (!pickMime()) { hint('这个浏览器不支持录制视频，请用 Chrome / Edge。', 'warn'); return; }
+  const codecs = await probeCodecs();
+  const canOffline = !!codecs.video;
+  if (!canOffline && !pickMime()) {
+    hint('这个浏览器不支持导出视频，请用 Chrome / Edge。', 'warn');
+    return;
+  }
 
   state.busy = true;
   $('expBtn').disabled = true;
@@ -1710,24 +1770,59 @@ async function doExport() {
     renderAt(0);
     await nextFrame();
 
-    const res = await exportVideo({
-      canvas: stage,
-      audio: ab,
-      totalMs: state.timeline.totalMs,
-      renderAt: (ms) => { state.ms = ms; renderAt(ms); },
-      onProgress: ({ ratio, ms }) => {
-        $('expFill').style.width = Math.round(ratio * 100) + '%';
-        $('expText').textContent = `录制中 ${fmt(ms)} / ${fmt(state.timeline.totalMs)}`;
-      },
-      signal: state.exportSignal,
-    });
-
     const stamp = new Date().toISOString().slice(5, 16).replace(/[-:T]/g, '');
-    downloadBlob(res.blob, `inkbrief-${state.timeline.scenes.length}段-${stamp}.${res.ext}`);
-    if (window.__ink) window.__ink.lastExport = res;
-    const size = (res.blob.size / 1048576).toFixed(1);
-    const drift = (res.audioMs - state.timeline.totalMs) / 1000;
-    hint(`已导出 ${res.ext.toUpperCase()} · ${size}MB · ${state.W}×${state.H} · 时长 ${fmt(state.timeline.totalMs)}（录制用了 ${(res.ms / 1000).toFixed(0)}s，音轨与时间轴差 ${drift.toFixed(2)}s）`);
+    const totalMs = state.timeline.totalMs;
+
+    if (canOffline) {
+      // ── 首选：WebCodecs 离线编码 ──
+      // 逐帧喂给编码器，不受墙钟限制：慢机只是多花时间，不会掉帧、不会音画错位。
+      const views = exportViews();
+      const res = await exportVideoOffline({
+        views,
+        audio: ab,
+        totalMs,
+        renderAt: (ms) => {
+          state.ms = ms;
+          const st = frameStateAt(ms);
+          if (!st) return;
+          for (const v of views) paintFrame(st, v);
+        },
+        onProgress: (p) => {
+          $('expFill').style.width = Math.round(p.ratio * 100) + '%';
+          const eta = p.etaMs > 1000 ? ` · 还要 ${fmt(p.etaMs)}` : '';
+          $('expText').textContent = `${p.stage} ${p.frame}/${p.totalFrames} 帧${eta}`;
+        },
+        signal: state.exportSignal,
+      });
+
+      for (const v of res.videos) {
+        downloadBlob(v.blob, `inkbrief-${v.label}-${state.timeline.scenes.length}段-${stamp}.${v.ext}`);
+      }
+      if (window.__ink) window.__ink.lastExport = res;
+      const size = (res.blob.size / 1048576).toFixed(1);
+      const drift = (res.audioMs - totalMs) / 1000;
+      const multi = res.videos.length > 1 ? ` · 共 ${res.videos.length} 个画幅` : '';
+      hint(`已导出 ${res.ext.toUpperCase()} · ${size}MB · ${res.videos.map((v) => v.label).join(' + ')}${multi} · 时长 ${fmt(totalMs)}（编码用了 ${(res.ms / 1000).toFixed(0)}s，音轨与时间轴差 ${drift.toFixed(2)}s）`);
+    } else {
+      // ── 兜底：MediaRecorder（Safari 16.4~25 有 VideoEncoder 但没 AudioEncoder 时的退路）──
+      const res = await exportVideo({
+        canvas: stage,
+        audio: ab,
+        totalMs,
+        renderAt: (ms) => { state.ms = ms; renderAt(ms); },
+        onProgress: ({ ratio, ms }) => {
+          $('expFill').style.width = Math.round(ratio * 100) + '%';
+          $('expText').textContent = `录制中 ${fmt(ms)} / ${fmt(totalMs)}`;
+        },
+        signal: state.exportSignal,
+      });
+
+      downloadBlob(res.blob, `inkbrief-${state.timeline.scenes.length}段-${stamp}.${res.ext}`);
+      if (window.__ink) window.__ink.lastExport = res;
+      const size = (res.blob.size / 1048576).toFixed(1);
+      const drift = (res.audioMs - totalMs) / 1000;
+      hint(`已导出 ${res.ext.toUpperCase()} · ${size}MB · ${state.W}×${state.H} · 时长 ${fmt(totalMs)}（录制用了 ${(res.ms / 1000).toFixed(0)}s，音轨与时间轴差 ${drift.toFixed(2)}s）`);
+    }
   } catch (err) {
     if (String(err.message).includes('已取消')) hint('导出已取消。');
     else hint('导出失败：' + (err.message || err), 'warn');
