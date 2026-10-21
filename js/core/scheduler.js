@@ -17,6 +17,12 @@
 
 /** @typedef {'queued'|'running'|'done'|'failed'|'cancelled'} TaskStatus */
 
+// 调度用 rAF（跟下一帧对齐），但 Node 里没有 rAF —— 降级成定时器，
+// 这样这份逻辑能脱离浏览器直接测。
+const raf = typeof requestAnimationFrame === 'function'
+  ? (fn) => requestAnimationFrame(fn)
+  : (fn) => setTimeout(() => fn(Date.now()), 16);
+
 export class TaskQueue {
   /**
    * @param {object} o
@@ -163,7 +169,7 @@ export class TaskQueue {
   _pump() {
     // 注意：_pumpRaf 存的是 rAF 的句柄，_pump 是方法名，别混用
     if (this._pumpRaf) return;
-    this._pumpRaf = requestAnimationFrame(() => {
+    this._pumpRaf = raf(() => {
       this._pumpRaf = null;
       this._drain();
     });

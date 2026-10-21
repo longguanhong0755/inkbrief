@@ -1,20 +1,20 @@
 // inkbrief 主逻辑：多图 + 多段 → 逐屏手绘 + 本地 TTS 配音 + 字幕 → 导出 MP4。
-import { StrokeRenderer } from './core/renderer.js?v=8';
-import { Compositor, computeLayout } from './core/compositor.js';
-import { CaptionPainter } from './core/subtitle.js';
+import { StrokeRenderer } from './core/renderer.js?v=9';
+import { Compositor, computeLayout } from './core/compositor.js?v=9';
+import { CaptionPainter } from './core/subtitle.js?v=9';
 import {
   buildTimeline, sceneAt, drawProgress, estimateDurationMs,
   itemAt, captionAt,
-} from './core/timeline.js';
-import { TTSEngine, VOICES, loadModel } from './tts/engine.js?v=8';
-import { buildSoundtrack, toAudioBuffer } from './audio/mix.js';
-import { exportVideo, exportVideoOffline, downloadBlob, pickMime, probeCodecs } from './core/exporter.js';
-import { makeDraggable, resolveDrop, applyDrop } from './ui/dragdrop.js';
-import { createTimelineView } from './ui/timeline-view.js';
-import { createScenePanel } from './ui/scene-panel.js';
-import { UndoStack } from './ui/undo.js';
-import { TaskQueue } from './core/scheduler.js';
-import { createQueuePanel } from './ui/queue-panel.js';
+} from './core/timeline.js?v=9';
+import { TTSEngine, VOICES, loadModel } from './tts/engine.js?v=9';
+import { buildSoundtrack, toAudioBuffer } from './audio/mix.js?v=9';
+import { exportVideo, exportVideoOffline, downloadBlob, pickMime, probeCodecs } from './core/exporter.js?v=9';
+import { makeDraggable, resolveDrop, applyDrop } from './ui/dragdrop.js?v=9';
+import { createTimelineView } from './ui/timeline-view.js?v=9';
+import { createScenePanel } from './ui/scene-panel.js?v=9';
+import { UndoStack } from './ui/undo.js?v=9';
+import { TaskQueue } from './core/scheduler.js?v=9';
+import { createQueuePanel } from './ui/queue-panel.js?v=9';
 
 const $ = (id) => document.getElementById(id);
 const MAX_SEGS = 12;
