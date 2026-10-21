@@ -84,9 +84,16 @@ const exp = await page.evaluate(async () => {
     if (window.__ink.lastExport) break;
   }
   const r = window.__ink.lastExport;
-  return r ? { size: r.blob.size, mime: r.mime, audioMs: Math.round(r.audioMs) } : null;
+  if (!r) return null;
+  // 大小不可靠：无配音时画面平坦，1080p 白纸+墨迹压出来可能只有几十 KB。
+  // 真正该验的是容器合法、MIME 是视频。
+  const head = [...new Uint8Array(await r.blob.slice(0, 12).arrayBuffer())]
+    .map((b) => b.toString(16).padStart(2, '0')).join(' ');
+  return { size: r.blob.size, mime: r.mime, audioMs: Math.round(r.audioMs), head };
 });
-ok('无配音仍产出视频', !!exp && exp.size > 50_000, exp ? `${(exp.size / 1048576).toFixed(2)}MB ${exp.mime}` : 'null');
+const headOk = !!exp && ((exp.head.startsWith('00 00 00') && exp.head.includes('66 74 79 70')) || exp.head.startsWith('1a 45 df a3'));
+ok('无配音仍产出视频', !!exp && exp.size > 0 && /^video\//.test(exp.mime || '') && headOk,
+  exp ? `${(exp.size / 1024).toFixed(0)}KB ${exp.mime} head=${exp.head.slice(0, 24)}` : 'null');
 
 console.log('── 手机宽度 ──');
 await page.setViewportSize({ width: 390, height: 844 });

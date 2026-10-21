@@ -5,6 +5,10 @@ import { createSequencer } from './phonemize.js';
 const DEFAULTS = {
   sampleRate: 22050,
   model: 'assets/tts/zh-huayan-fp16.onnx',
+  // 模型解压后的真实字节数。GitHub Pages 等 CDN 会对 .onnx 做 gzip，
+  // 此时 content-length 是压缩后大小（约 9.0MB），而 reader 读到的是解压后的
+  // 字节（10.13MB），直接拿 content-length 当总量会让进度冲到 113%。
+  modelBytes: 10617727,
   phonemes: 'assets/tts/zh-phonemes.json',
   wasmPath: 'js/vendor/ort/',
 };
@@ -25,10 +29,14 @@ export const VOICES = [
   },
 ];
 
-async function fetchWithProgress(url, onProgress) {
+async function fetchWithProgress(url, onProgress, expectedBytes = 0) {
   const res = await fetch(url, { cache: 'force-cache' });
   if (!res.ok) throw new Error(`下载失败 ${res.status} ${url}`);
-  const total = Number(res.headers.get('content-length')) || 0;
+  const headerLen = Number(res.headers.get('content-length')) || 0;
+  const encoding = (res.headers.get('content-encoding') || 'identity').toLowerCase();
+  // 响应被压缩时 content-length 与解压后的字节数不是一回事，改用已知的真实大小
+  const compressed = encoding !== 'identity' && encoding !== '';
+  let total = compressed ? (expectedBytes || 0) : (headerLen || expectedBytes || 0);
   if (!res.body || !total) {
     const buf = await res.arrayBuffer();
     onProgress?.(buf.byteLength, buf.byteLength);
@@ -42,6 +50,8 @@ async function fetchWithProgress(url, onProgress) {
     if (done) break;
     chunks.push(value);
     got += value.length;
+    // 兜底：总量估小时不让进度倒退或越过 100%
+    if (got > total) total = got;
     onProgress?.(got, total);
   }
   const out = new Uint8Array(got);
@@ -82,12 +92,13 @@ export class TTSEngine {
       // 模型是下载大头，给出真实字节进度（占 0.1 ~ 0.9）
       onProgress?.({ phase: 'model', ratio: 0.06, text: '下载语音模型' });
       const buf = await fetchWithProgress(this.opts.model, (got, total) => {
+        const frac = Math.min(1, got / total);
         onProgress?.({
           phase: 'model',
-          ratio: 0.06 + 0.84 * (got / total),
+          ratio: 0.06 + 0.84 * frac,
           text: `下载语音模型 ${(got / 1048576).toFixed(1)} / ${(total / 1048576).toFixed(1)} MB`,
         });
-      });
+      }, this.opts.modelBytes);
 
       onProgress?.({ phase: 'init', ratio: 0.93, text: '初始化推理引擎' });
       this.session = await ort.InferenceSession.create(buf, { executionProviders: ['wasm'], graphOptimizationLevel: 'all' });
