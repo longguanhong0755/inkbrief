@@ -276,7 +276,9 @@ export function drawProgress(scene, local) {
 /**
  * 时间轴块的布局：块宽正比于时长。
  * @param {Array} scenes
- * @param {object} o {width, totalMs, minWidth, gap}
+ * @param {object} o {width, totalMs, minWidth, gap, pxPerMs}
+ *   - 给了 pxPerMs：按「每秒多少像素」算，宽度可以超出容器（缩放模式）
+ *   - 否则按 width 把总时长摊开（适应模式）
  * @returns {{blocks:Array, contentWidth:number, scale:number}}
  */
 export function layoutTrack(scenes, o = {}) {
@@ -285,16 +287,19 @@ export function layoutTrack(scenes, o = {}) {
   const gap = o.gap === undefined ? 4 : Number(o.gap) || 0;
   const minWidth = o.minWidth === undefined ? 40 : Number(o.minWidth) || 0;
   const totalMs = Math.max(1, Number(o.totalMs) || list.reduce((a, s) => a + s.dur, 0) || 1);
+  // 缩放模式：直接给「每秒多少像素」
+  const pxPerMs = o.pxPerMs ? Number(o.pxPerMs) : 0;
+  const span = pxPerMs > 0 ? totalMs * pxPerMs : width;
 
   const blocks = [];
   let x = 0;
   for (const sc of list) {
-    const w = Math.max(minWidth, (sc.dur / totalMs) * width);
+    const w = Math.max(minWidth, (sc.dur / totalMs) * span);
     blocks.push({ id: sc.id, index: sc.index, x, w, dur: sc.dur, start: sc.start });
     x += w + gap;
   }
   const contentWidth = Math.max(0, x - (list.length ? gap : 0));
-  return { blocks, contentWidth, scale: width / totalMs };
+  return { blocks, contentWidth, scale: span / totalMs };
 }
 
 /**

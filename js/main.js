@@ -10,6 +10,7 @@ import { TTSEngine, VOICES, loadModel } from './tts/engine.js?v=8';
 import { buildSoundtrack, toAudioBuffer } from './audio/mix.js';
 import { exportVideo, downloadBlob, pickMime } from './core/exporter.js';
 import { makeDraggable, resolveDrop, applyDrop } from './ui/dragdrop.js';
+import { createTimelineView } from './ui/timeline-view.js';
 
 const $ = (id) => document.getElementById(id);
 const MAX_SEGS = 12;
@@ -48,6 +49,7 @@ let jobSeq = 0;
 const pendingJobs = new Map();
 let compositor = null;
 let painter = null;
+let timelineView = null;
 const stage = $('stage');
 
 // ── 小工具 ────────────────────────────────────────────
@@ -71,6 +73,7 @@ async function boot() {
   bindUI();
   ensureCanvas();
   initWorker();
+  initTimelineView();
 
   const engine = new TTSEngine();
   state.tts = engine;
@@ -940,6 +943,7 @@ function rebuild() {
   $('expBtn').disabled = !state.timeline.totalMs;
 
   renderChips();
+  timelineView?.render();
   state.ms = Math.min(state.ms, state.timeline.totalMs);
   renderAt(state.ms);
   updateTransport();
@@ -962,6 +966,57 @@ function renderChips() {
     });
     box.appendChild(b);
   });
+}
+
+// ── 底部时间轴 ──────────────────────────────────────
+function initTimelineView() {
+  const el = $('timeline');
+  if (!el) return;
+  timelineView = createTimelineView({
+    root: el,
+    state,
+    onSeek: (ms) => {
+      pause();
+      state.ms = ms;
+      renderAt(state.ms);
+      updateTransport();
+    },
+    onSelect: (segId) => {
+      state.selectedSeg = segId;
+      highlightSegCard(segId);
+    },
+    onReorder: (from, to) => {
+      // 时间轴上的屏序 = state.segs 的序（未配图的段不出片，不在时间轴里）
+      const tl = state.timeline;
+      if (!tl) return;
+      const fromSeg = tl.scenes[from];
+      const toSeg = tl.scenes[to];
+      if (!fromSeg || !toSeg) return;
+      const i = state.segs.findIndex((s) => s.id === fromSeg.id);
+      const j = state.segs.findIndex((s) => s.id === toSeg.id);
+      if (i < 0 || j < 0) return;
+      reorderSeg(i, j);
+    },
+    onResize: (segId, ms) => {
+      const seg = state.segs.find((s) => s.id === segId);
+      if (!seg) return;
+      seg.manualMs = Math.round(ms);
+      rebuild();
+      renderSegs();
+    },
+    onStatus: (segId, msg) => hint(msg, 'warn'),
+  });
+}
+
+/** 选中某段时，段卡上也高亮一下 */
+function highlightSegCard(segId) {
+  document.querySelectorAll('.seg.sel').forEach((e) => e.classList.remove('sel'));
+  if (!segId) return;
+  const card = document.querySelector(`.seg[data-segid="${segId}"]`);
+  if (card) {
+    card.classList.add('sel');
+    card.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }
 }
 
 // ── 渲染 ──────────────────────────────────────────────
@@ -1067,6 +1122,8 @@ function renderAt(ms) {
 
   const chips = $('chips').children;
   for (let i = 0; i < chips.length; i++) chips[i].classList.toggle('on', i === sc.index);
+  // 播放头跟着走（只改 transform，不重建整条时间轴）
+  timelineView?.updateHead();
 }
 
 function updateTransport() {

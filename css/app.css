@@ -26,6 +26,11 @@ body {
   color: var(--ink);
   font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
   -webkit-font-smoothing: antialiased;
+  /* 应用外壳：顶栏与时间轴各占一格，中间自己滚动。
+     这样时间轴永远在底部且不会盖住任何内容（用 fixed 就会盖）。 */
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 
 button { font: inherit; cursor: pointer; }
@@ -38,15 +43,17 @@ input, select, textarea { font: inherit; color: inherit; }
   padding: 14px 20px;
   background: rgba(255,253,249,.9);
   border-bottom: 1px solid var(--line);
-  position: sticky; top: 0; z-index: 20;
+  flex: 0 0 auto;
+  z-index: 20;
   backdrop-filter: blur(8px);
 }
 .brand { display: flex; align-items: baseline; gap: 10px; }
 .brand .mark { font-size: 18px; font-weight: 700; letter-spacing: .2px; }
 .brand .tag { color: var(--muted); font-size: 12.5px; }
 .top-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.sel { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12.5px; }
-.sel select {
+/* 只给顶栏的 label 用；.seg.sel / .tl-block.sel 是「选中态」，不能继承这行 */
+label.sel { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12.5px; }
+label.sel select {
   padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px;
   background: #fff; color: var(--ink); font-size: 13px;
 }
@@ -70,6 +77,11 @@ button.link {
   gap: 14px;
   padding: 14px;
   align-items: start;
+  /* 中间这格自己滚动：顶栏和底部时间轴都常驻，中间内容再多也不顶掉它们 */
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 .pane {
   background: var(--card);
@@ -314,6 +326,78 @@ body.is-dragging * { cursor: grabbing !important; }
 .bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .25s; }
 .boot-note { font-size: 12px; color: var(--muted); margin: 10px 0 12px; font-variant-numeric: tabular-nums; }
 
+/* ── 底部时间轴 ─────────────────────────────────── */
+/* 在应用外壳里占一格（不 fixed）：永远贴在底部，且不会盖住任何内容。 */
+.timeline {
+  flex: 0 0 auto;
+  background: var(--card);
+  border-top: 1px solid var(--line);
+  box-shadow: 0 -6px 20px rgba(70,60,44,.07);
+  padding: 9px 14px 11px;
+}
+.tl-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.tl-title { font-size: 12.5px; font-weight: 600; color: var(--muted); }
+.tl-total { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.tl-zooms { margin-left: auto; display: flex; gap: 3px; }
+.tl-zoom {
+  border: 1px solid var(--line); background: #fff; border-radius: 6px;
+  padding: 2px 8px; font-size: 11.5px; color: var(--muted); cursor: pointer;
+}
+.tl-zoom:hover { border-color: var(--accent); color: var(--accent); }
+.tl-zoom.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+.tl-scroll { overflow-x: auto; overflow-y: hidden; padding-bottom: 4px; }
+.tl-track { position: relative; height: 58px; min-width: 100%; }
+.tl-empty { color: var(--muted); font-size: 12.5px; margin: 12px 0; }
+
+.tl-block {
+  position: absolute; top: 0; height: 48px;
+  border: 1px solid var(--line); border-radius: 8px;
+  background: #fdfbf6; cursor: grab;
+  display: grid; grid-template-rows: auto 1fr; align-content: start;
+  padding: 4px 7px; overflow: hidden;
+  transition: background .12s, border-color .12s;
+}
+.tl-block:hover { background: #f8f2e8; }
+.tl-block.sel { border-color: var(--accent); background: #fdf4ef; }
+.tl-block:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.tl-block.moving { z-index: 5; cursor: grabbing; box-shadow: 0 5px 16px rgba(60,48,32,.2); pointer-events: none; }
+.tl-block.drop-target { border-color: var(--accent); border-style: dashed; }
+.tl-block.resizing { border-color: var(--accent); }
+
+.tl-no {
+  font-size: 10.5px; font-weight: 600; color: #fff; background: var(--accent);
+  border-radius: 20px; padding: 0 6px; justify-self: start; line-height: 15px;
+}
+.tl-dur {
+  font-size: 12.5px; font-weight: 500; color: var(--ink);
+  font-variant-numeric: tabular-nums; margin-top: 2px;
+}
+.tl-meta {
+  font-size: 10.5px; color: var(--muted); font-variant-numeric: tabular-nums;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* 右边缘的时长把手 */
+.tl-grip {
+  position: absolute; right: 0; top: 0; bottom: 0; width: 8px;
+  cursor: ew-resize; background: linear-gradient(90deg, transparent, rgba(196,85,59,.16));
+  border-radius: 0 8px 8px 0;
+}
+.tl-grip:hover { background: rgba(196,85,59,.3); }
+
+.tl-head {
+  position: absolute; top: -3px; bottom: -3px; width: 2px;
+  background: var(--accent); pointer-events: none; z-index: 6;
+  will-change: transform;
+}
+.tl-head::before {
+  content: ''; position: absolute; top: -3px; left: -4px;
+  width: 10px; height: 10px; border-radius: 50%; background: var(--accent);
+}
+
+/* 段卡被时间轴选中 */
+.seg.sel { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(196,85,59,.12); }
+
 /* ── 窄屏 ───────────────────────────────────── */
 @media (max-width: 1100px) {
   .grid { grid-template-columns: 1fr; }
@@ -325,4 +409,6 @@ body.is-dragging * { cursor: grabbing !important; }
   .brand .tag { display: none; }
   .grid { padding: 10px; gap: 10px; }
   .speed input[type=range] { width: 72px; }
+  .tl-block { padding: 3px 5px; }
+  .timeline { padding: 8px 10px 10px; }
 }
