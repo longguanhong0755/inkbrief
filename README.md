@@ -121,14 +121,21 @@ python -m http.server 8000
 
 推 `main` 分支后 Pages 自动构建，约 1 分钟生效。
 
-**首次打开需要下载 21MB**（语音模型 10.1MB + onnxruntime wasm 11.2MB），之后走浏览器缓存。
-GitHub Pages 的 CDN 在国内实测只有 50～60 KB/s，10MB 的模型要 200 秒左右——这是网络现实，
-不是代码问题，本地 `http.server` 是秒开。如果主要给国内用户访问，把 `assets/tts/`
-和 `js/vendor/ort/` 换成 jsDelivr 之类的国内可达 CDN 会快 4～6 倍。
+**首次打开需要下载 21MB**（语音模型 10.1MB + onnxruntime wasm 10.7MB + 字体 3.1MB），
+之后走浏览器缓存，第二次打开明显快。
+
+这几个文件都走**分片下载**：切成 1MB 的片、3 路并发、每片最多重试 3 次，下满才收。
+这不是优化而是必需——GitHub Pages 在国内只有 50～60 KB/s，一个 10MB 的长连接活不到
+200 秒就会被重置（`ERR_CONNECTION_RESET`），整包下载必然失败。分片之后实测线上
+**141 秒**完成加载、语音引擎就绪。下载完的内容存进 Cache Storage，服务端不支持
+Range 时会自动退回整包下载。
+
+想把速度再提上去，可以把 `assets/tts/` 和 `js/vendor/ort/` 换成国内可达的 CDN
+（jsDelivr 实测快 4～6 倍），分片逻辑本身不用改。
 
 **改完 js 记得改版本号。** 入口脚本和模块引用都带 `?v=N`（见 `index.html` 与 `js/main.js`），
 Pages 对 `.js` 有 10 分钟缓存，只改内容不改 URL 的话老访客会继续用旧文件。改代码时把
-`?v=6` 一起升上去。
+`?v=7` 一起升上去。
 
 ## 测试
 

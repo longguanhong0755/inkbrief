@@ -14,9 +14,22 @@ const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
 
 const errors = [];
 const failed = [];
-page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text().slice(0, 300)); });
+// 大文件（模型 / wasm / 字体）走分片下载，单片被掐断后会重试，
+// 所以 Range 请求的失败是预期内的，只当作提示，不算失败。
+const RETRIABLE = /zh-huayan-fp16\.onnx|ort-wasm-simd-threaded\.wasm|MaShanZheng-Regular\.woff2/;
+const retried = [];
+page.on('console', (m) => {
+  if (m.type() !== 'error') return;
+  const text = m.text().slice(0, 300);
+  const from = m.location()?.url || '';
+  if (RETRIABLE.test(from)) retried.push(text); else errors.push(text);
+});
 page.on('pageerror', (e) => errors.push('pageerror: ' + String(e).slice(0, 300)));
-page.on('requestfailed', (r) => failed.push(r.url() + ' :: ' + (r.failure()?.errorText || '')));
+page.on('requestfailed', (r) => {
+  const isRange = !!r.headers()['range'] || RETRIABLE.test(r.url());
+  const line = r.url() + ' :: ' + (r.failure()?.errorText || '');
+  if (isRange) retried.push(line); else failed.push(line);
+});
 
 const t0 = Date.now();
 await page.goto(URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
@@ -66,6 +79,7 @@ console.log('启动耗时', (bootMs / 1000).toFixed(1) + 's', 'boot 完成:', bo
 console.log(JSON.stringify(info, null, 1));
 console.log('合成:', JSON.stringify(synth));
 console.log('console errors:', errors.length, errors.slice(0, 6));
+console.log('分片重试记录（正常现象）:', retried.length, retried.slice(0, 3));
 console.log('failed requests:', failed.length, failed.slice(0, 6));
 
 await page.screenshot({ path: 'dev/out/smoke.png', fullPage: false });
