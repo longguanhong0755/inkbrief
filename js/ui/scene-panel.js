@@ -255,14 +255,14 @@ export function createScenePanel(o) {
       <div class="sp-sec">这一屏多长</div>
       <div class="sp-time-now">
         <b>${(sc.dur / 1000).toFixed(1)}s</b>
-        <span>时长来自：${source}</span>
+        <span data-source>时长来自：${source}</span>
       </div>
       <input class="sp-range" type="range" min="${lo}" max="${hi}" value="${val}" step="50">
       <p class="sp-note">
         拖滑块改这一屏的时长。
         ${audioMs ? `配音是 ${(audioMs / 1000).toFixed(1)}s，会变速到 ${speed.toFixed(2)}× 来对齐——不会截断也不会重录。` : '这一屏还没配音，时长是按字数估的。'}
       </p>
-      ${manual > 0 ? '<button class="ghost" type="button" data-act="auto">恢复自动时长</button>' : ''}
+      <button class="ghost" type="button" data-act="auto" ${manual > 0 ? '' : 'disabled'}>恢复自动时长</button>
 
       <div class="sp-sec">这一屏的时间都去哪了</div>
       <ul class="sp-break">
@@ -278,20 +278,33 @@ export function createScenePanel(o) {
     `;
 
     const range = elBody.querySelector('.sp-range');
+    // 拖动时记下起始值：撤销要回到这里，而不是松手前一刻
+    let durBefore = null;
+    range?.addEventListener('pointerdown', () => { durBefore = sc.dur; });
     range?.addEventListener('input', (e) => {
-      // 拖动时只改数字，不重画（重画会把滑块从手指底下抽走）
+      if (durBefore == null) durBefore = sc.dur;
+      // 拖动时只改数字和几处文案，不重画（重画会把滑块从手指底下抽走）
       const ms = Number(e.target.value);
       const big = elBody.querySelector('.sp-time-now b');
       if (big) big.textContent = (ms / 1000).toFixed(1) + 's';
+      // 一旦手动拖了，时长来源就变成「手动」
+      const src = elBody.querySelector('[data-source]');
+      if (src) src.textContent = '时长来自：手动';
+      const auto = elBody.querySelector('[data-act="auto"]');
+      if (auto) auto.disabled = false;
       o.onDuration?.(seg.id, ms);
     });
-    // 松手后重画一次，把明细刷新过来
-    range?.addEventListener('change', () => {
+    // 松手后记一步可撤销的
+    range?.addEventListener('change', (e) => {
+      const ms = Number(e.target.value);
+      const before = durBefore;
+      durBefore = null;
+      o.onDurationEnd?.(seg.id, ms, before);
       setEditing(false);
       render();
     });
     elBody.querySelector('[data-act="auto"]')?.addEventListener('click', () => {
-      o.onDuration?.(seg.id, null);
+      o.onDurationEnd?.(seg.id, null, sc.dur);
       setEditing(false);
       render();
     });

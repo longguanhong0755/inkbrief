@@ -74,17 +74,18 @@ T('时间 tab：改时长要落到数据上');
 await page.locator('.sp-tab', { hasText: '时间' }).click();
 await page.waitForTimeout(250);
 const durBefore = await page.evaluate(() => Math.round(window.__ink.timeline.scenes[1].dur));
-// 把滑块推到最大
+// 把滑块推到最大（模拟一次完整拖动：input + change）
 const slider = page.locator('#scenePanel .sp-range');
 await slider.evaluate((el) => {
   el.value = String(Number(el.max));
   el.dispatchEvent(new Event('input', { bubbles: true }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
 });
-await page.waitForTimeout(400);
+await page.waitForTimeout(500);
 const durAfter = await page.evaluate(() => Math.round(window.__ink.timeline.scenes[1].dur));
 ok('时长变长了', durAfter > durBefore, `${durBefore}ms → ${durAfter}ms`);
 ok('时长来源变成「手动」', /手动/.test(await page.locator('#scenePanel .sp-time-now').textContent()));
-ok('出现「恢复自动时长」', await page.locator('#scenePanel [data-act="auto"]').count() === 1);
+ok('「恢复自动时长」可用了', !(await page.locator('#scenePanel [data-act="auto"]').isDisabled()));
 
 // 恢复自动
 await page.locator('#scenePanel [data-act="auto"]').click();

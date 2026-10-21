@@ -12,6 +12,7 @@ import { exportVideo, downloadBlob, pickMime } from './core/exporter.js';
 import { makeDraggable, resolveDrop, applyDrop } from './ui/dragdrop.js';
 import { createTimelineView } from './ui/timeline-view.js';
 import { createScenePanel } from './ui/scene-panel.js';
+import { UndoStack } from './ui/undo.js';
 
 const $ = (id) => document.getElementById(id);
 const MAX_SEGS = 12;
@@ -56,6 +57,7 @@ let scenePanel = null;
 // 场景栏正在自己编辑（打字、拖滑块）时，别重画它——否则输入框会失焦。
 // 由场景栏的回调置位，rebuild/renderSegs 读它来决定要不要跳过面板重绘。
 let panelEditing = false;
+let undoStack = null;
 const stage = $('stage');
 
 // ── 小工具 ────────────────────────────────────────────
@@ -81,6 +83,8 @@ async function boot() {
   initWorker();
   initTimelineView();
   initScenePanel();
+  initUndo();
+  bindUndoUI();
 
   const engine = new TTSEngine();
   state.tts = engine;
@@ -203,7 +207,7 @@ async function addFiles(files) {
     try {
       const img = await loadImage(f);
       const scaled = scaleTo(img, MAX_EDGE);
-      state.assets.push({
+      const asset = {
         id: uid(),
         name: f.name.replace(/\.[^.]+$/, ''),
         el: scaled.canvas,
@@ -213,7 +217,9 @@ async function addFiles(files) {
         strokes: null,
         clips: null,
         pipelineMs: 0,
-      });
+      };
+      assetPool.set(asset.id, asset);
+      state.assets.push(asset);
     } catch (err) {
       hint(`「${f.name}」读不了：` + err.message, 'warn');
     }
@@ -444,6 +450,7 @@ function splitScript(rule = 'auto') {
   renderSegs();
   rebuild();
   refreshGenButton();
+  undoStack?.clear();
 }
 /** 在光标处把一段拆成两段 */
 function splitSegAt(segId, caret) {
@@ -456,53 +463,59 @@ function splitSegAt(segId, caret) {
   const a = text.slice(0, at).trim();
   const b = text.slice(at).trim();
   if (!a || !b) { hint('光标位置切不出两段。', 'warn'); return; }
-  const next = makeSeg({ paragraphs: [b] });
-  // 拆出来的后半段继承原段的图与设置
-  next.imageIds = [...seg.imageIds];
-  next.weights = [...seg.weights];
-  next.capPos = seg.capPos;
-  seg.paragraphs = [a];
-  seg.imageIds = [];
-  seg.weights = [];
-  state.segs.splice(idx + 1, 0, next);
-  state.renderers.clear();
-  renderSegs();
-  rebuild();
+  undoable('拆分这一段', () => {
+    const next = makeSeg({ paragraphs: [b] });
+    // 拆出来的后半段继承原段的图与设置
+    next.imageIds = [...seg.imageIds];
+    next.weights = [...seg.weights];
+    next.capPos = seg.capPos;
+    seg.paragraphs = [a];
+    seg.imageIds = [];
+    seg.weights = [];
+    state.segs.splice(idx + 1, 0, next);
+    state.renderers.clear();
+    renderSegs();
+    rebuild();
+  });
 }
 
 /** 把一段并到上一段 */
 function mergeSegWithPrev(segId) {
   const idx = state.segs.findIndex((s) => s.id === segId);
   if (idx <= 0) { hint('第一段没法再往上并了。', 'warn'); return; }
-  const prev = state.segs[idx - 1];
-  const cur = state.segs[idx];
-  prev.paragraphs = [...segParagraphs(prev), ...segParagraphs(cur)];
-  // 上一段没图就把这一段的图接过去
-  if (!prev.imageIds.length && cur.imageIds.length) {
-    prev.imageIds = [...cur.imageIds];
-    prev.weights = [...cur.weights];
-  }
-  state.segs.splice(idx, 1);
-  state.renderers.clear();
-  renderSegs();
-  rebuild();
+  undoable('并入上一段', () => {
+    const prev = state.segs[idx - 1];
+    const cur = state.segs[idx];
+    prev.paragraphs = [...segParagraphs(prev), ...segParagraphs(cur)];
+    // 上一段没图就把这一段的图接过去
+    if (!prev.imageIds.length && cur.imageIds.length) {
+      prev.imageIds = [...cur.imageIds];
+      prev.weights = [...cur.weights];
+    }
+    state.segs.splice(idx, 1);
+    state.renderers.clear();
+    renderSegs();
+    rebuild();
+  });
 }
 
 /** 把一段并到下一段 */
 function mergeSegWithNext(segId) {
   const idx = state.segs.findIndex((s) => s.id === segId);
   if (idx < 0 || idx >= state.segs.length - 1) { hint('最后一段没法再往下并了。', 'warn'); return; }
-  const cur = state.segs[idx];
-  const next = state.segs[idx + 1];
-  next.paragraphs = [...segParagraphs(cur), ...segParagraphs(next)];
-  if (!next.imageIds.length && cur.imageIds.length) {
-    next.imageIds = [...cur.imageIds];
-    next.weights = [...cur.weights];
-  }
-  state.segs.splice(idx, 1);
-  state.renderers.clear();
-  renderSegs();
-  rebuild();
+  undoable('并入下一段', () => {
+    const cur = state.segs[idx];
+    const next = state.segs[idx + 1];
+    next.paragraphs = [...segParagraphs(cur), ...segParagraphs(next)];
+    if (!next.imageIds.length && cur.imageIds.length) {
+      next.imageIds = [...cur.imageIds];
+      next.weights = [...cur.weights];
+    }
+    state.segs.splice(idx, 1);
+    state.renderers.clear();
+    renderSegs();
+    rebuild();
+  });
 }
 
 /** 段落重排：把 from 位置的段移到 to 位置 */
@@ -511,11 +524,13 @@ function reorderSeg(from, to) {
   const f = Math.max(0, Math.min(n - 1, Number(from) | 0));
   const t = Math.max(0, Math.min(n - 1, Number(to) | 0));
   if (f === t) return;
-  const [item] = state.segs.splice(f, 1);
-  state.segs.splice(t, 0, item);
-  state.renderers.clear();
-  renderSegs();
-  rebuild();
+  undoable('调整段落顺序', () => {
+    const [item] = state.segs.splice(f, 1);
+    state.segs.splice(t, 0, item);
+    state.renderers.clear();
+    renderSegs();
+    rebuild();
+  });
 }
 
 /** 素材重排 */
@@ -524,27 +539,31 @@ function reorderAssets(from, to) {
   const f = Math.max(0, Math.min(n - 1, Number(from) | 0));
   const t = Math.max(0, Math.min(n - 1, Number(to) | 0));
   if (f === t) return;
-  const [item] = state.assets.splice(f, 1);
-  state.assets.splice(t, 0, item);
-  renderThumbs();
-  renderSegs();
-  rebuild();
+  undoable('调整素材顺序', () => {
+    const [item] = state.assets.splice(f, 1);
+    state.assets.splice(t, 0, item);
+    renderThumbs();
+    renderSegs();
+    rebuild();
+  });
 }
 
 /** 删一张图：引用它的段会变成未配图（有汇总提示，不会静默吞掉） */
 function removeAsset(assetId) {
   const a = state.assets.find((x) => x.id === assetId);
   if (!a) return;
-  state.assets = state.assets.filter((x) => x.id !== assetId);
-  for (const s of state.segs) {
-    const i = s.imageIds.indexOf(assetId);
-    if (i >= 0) s.imageIds.splice(i, 1);
-    if (s.weights.length === s.imageIds.length) s.weights = s.imageIds.map(() => 1);
-  }
-  state.renderers.clear();
-  renderThumbs();
-  renderSegs();
-  rebuild();
+  undoable('删掉一张图', () => {
+    state.assets = state.assets.filter((x) => x.id !== assetId);
+    for (const s of state.segs) {
+      const i = s.imageIds.indexOf(assetId);
+      if (i >= 0) s.imageIds.splice(i, 1);
+      if (s.weights.length === s.imageIds.length) s.weights = s.imageIds.map(() => 1);
+    }
+    state.renderers.clear();
+    renderThumbs();
+    renderSegs();
+    rebuild();
+  });
 }
 
 function autoBind() {
@@ -642,16 +661,19 @@ function renderSegs() {
     `;
 
     const ta = el.querySelector('textarea');
+    // 打字：连续输入合并成一步撤销（coalesceKey 相同就并进上一步）
     ta.addEventListener('input', () => {
-      setSegText(seg, ta.value);
-      el.querySelector('.wc').textContent = `${ta.value.replace(/\s/g, '').length} 字`;
-      if (seg.audio) {
-        seg.status = 'stale';
-        const pill = el.querySelector('.seg-head .right');
-        if (pill) pill.innerHTML = '<span class="pill warn">文案改过，需重配</span>';
-      }
-      clearTimeout(seg._t);
-      seg._t = setTimeout(() => rebuild(), 600);
+      undoable('改文案', () => {
+        setSegText(seg, ta.value);
+        el.querySelector('.wc').textContent = `${ta.value.replace(/\s/g, '').length} 字`;
+        if (seg.audio) {
+          seg.status = 'stale';
+          const pill = el.querySelector('.seg-head .right');
+          if (pill) pill.innerHTML = '<span class="pill warn">文案改过，需重配</span>';
+        }
+        clearTimeout(seg._t);
+        seg._t = setTimeout(() => rebuild(), 600);
+      }, 'text:' + seg.id);
     });
 
     el.querySelector('.pick').addEventListener('click', () => cycleAsset(seg));
@@ -705,18 +727,42 @@ function renderSegs() {
       else if (op === 'del') removeSeg(seg.id);
       else if (op === 'cap') {
         const order = ['bottom', 'lower', 'upper'];
-        seg.capPos = order[(order.indexOf(seg.capPos) + 1) % order.length];
-        renderSegs(); rebuild();
+        undoable('改字幕位置', () => {
+          seg.capPos = order[(order.indexOf(seg.capPos) + 1) % order.length];
+          renderSegs(); rebuild();
+        });
       }
     });
 
     const slider = el.querySelector('input[type=range]');
     const valEl = el.querySelector('.val');
+    // 拖滑块改时长。
+    // 拖动过程中（input）直接改值、刷新预览，不进历史——
+    // 否则一次拖动会记几十步。松手时（change）才补记一步可撤销的。
+    let durBefore = null;
+    slider.addEventListener('pointerdown', () => {
+      durBefore = Number(seg.manualMs) || 0;
+    });
     slider.addEventListener('input', () => {
+      if (durBefore == null) durBefore = Number(seg.manualMs) || 0;
       seg.manualMs = Number(slider.value);
       const s = audioMs ? audioMs / seg.manualMs : 1;
       valEl.textContent = `${(seg.manualMs / 1000).toFixed(1)}s${audioMs ? ` · ${s.toFixed(2)}×` : ''}`;
       rebuild();
+    });
+    slider.addEventListener('change', () => {
+      const after = Number(seg.manualMs) || 0;
+      const before = durBefore;
+      durBefore = null;
+      if (before == null || before === after) return;
+      // 撤销要回到「拖动前」的值
+      undoStack?.runWithBefore('改这一屏的时长', () => {
+        seg.manualMs = after;
+        rebuild();
+      }, (snap) => ({
+        ...snap,
+        segs: snap.segs.map((s) => (s.id === seg.id ? { ...s, manualMs: before } : s)),
+      }));
     });
 
     // 点段卡空白处 = 选中这一屏（右侧场景栏跟着显示）
@@ -758,25 +804,29 @@ function updateUnboundHint(unbound) {
 function removeSeg(segId) {
   const idx = state.segs.findIndex((s) => s.id === segId);
   if (idx < 0) return;
-  state.segs.splice(idx, 1);
-  state.renderers.clear();
-  renderSegs();
-  rebuild();
+  undoable('删掉一段', () => {
+    state.segs.splice(idx, 1);
+    state.renderers.clear();
+    renderSegs();
+    rebuild();
+  });
 }
 
 /**
  * 设置某一段的字幕分句与位置。UI 与外部调用走同一入口。
  */
-function setSegCaptions(segId, paragraphs, capPos = null) {
+function setSegCaptions(segId, paragraphs, capPos = null, label = '改字幕') {
   const seg = state.segs.find((s) => s.id === segId);
   if (!seg) return false;
   const list = (paragraphs || []).map(String);
-  seg.paragraphs = list.length ? list : [''];
-  if (capPos) seg.capPos = capPos;
-  // 面板正在被编辑时不重画它，否则打字会失焦
-  if (!panelEditing) renderSegs();
-  rebuild();
-  if (!panelEditing) scenePanel?.render();
+  undoable(label, () => {
+    seg.paragraphs = list.length ? list : [''];
+    if (capPos) seg.capPos = capPos;
+    // 面板正在被编辑时不重画它，否则打字会失焦
+    if (!panelEditing) renderSegs();
+    rebuild();
+    if (!panelEditing) scenePanel?.render();
+  }, 'caption:' + segId);
   return true;
 }
 
@@ -787,19 +837,22 @@ function setSegCaptions(segId, paragraphs, capPos = null) {
  * @param {string[]} imageIds
  * @param {number[]} [weights] 与 imageIds 等长；不给则全为 1
  */
-function setSegImages(segId, imageIds, weights = null) {
+function setSegImages(segId, imageIds, weights = null, label = '改配图') {
   const seg = state.segs.find((s) => s.id === segId);
   if (!seg) return false;
   const ids = (imageIds || []).filter(Boolean);
-  seg.imageIds = ids;
-  seg.weights = weights && weights.length === ids.length
+  const ws = weights && weights.length === ids.length
     ? weights.map((w) => Math.max(0.05, Number(w) || 1))
     : ids.map(() => 1);
-  state.renderers.clear();
-  if (!panelEditing) renderThumbs();
-  if (!panelEditing) renderSegs();
-  rebuild();
-  if (!panelEditing) scenePanel?.render();
+  undoable(label, () => {
+    seg.imageIds = ids;
+    seg.weights = ws;
+    state.renderers.clear();
+    if (!panelEditing) renderThumbs();
+    if (!panelEditing) renderSegs();
+    rebuild();
+    if (!panelEditing) scenePanel?.render();
+  });
   return true;
 }
 
@@ -810,30 +863,30 @@ function setSegImages(segId, imageIds, weights = null) {
  */
 function cycleAsset(seg, slotIndex = null) {
   if (!state.assets.length) { hint('先加图片。', 'warn'); return; }
-  if (slotIndex === null) {
-    const idx = state.assets.findIndex((a) => a.id === seg.assetId);
-    const next = state.assets[(idx + 1) % state.assets.length].id;
-    if (seg.imageIds.length <= 1) {
-      seg.imageIds = [next];
-      seg.weights = [1];
+  undoable('换图', () => {
+    if (slotIndex === null) {
+      const idx = state.assets.findIndex((a) => a.id === seg.assetId);
+      const next = state.assets[(idx + 1) % state.assets.length].id;
+      if (seg.imageIds.length <= 1) {
+        seg.imageIds = [next];
+        seg.weights = [1];
+      } else {
+        // 多图时整体轮换 = 整组往后挪一位
+        const rot = seg.imageIds.map((id) => {
+          const i = state.assets.findIndex((a) => a.id === id);
+          return state.assets[(i + 1) % state.assets.length].id;
+        });
+        seg.imageIds = rot;
+      }
     } else {
-      // 多图时整体轮换 = 整组往后挪一位
-      const cur = state.assets.findIndex((a) => a.id === seg.imageIds[0]);
-      const rot = seg.imageIds.map((id) => {
-        const i = state.assets.findIndex((a) => a.id === id);
-        return state.assets[(i + 1) % state.assets.length].id;
-      });
-      void cur;
-      seg.imageIds = rot;
+      const i = slotIndex;
+      if (i < 0 || i >= seg.imageIds.length) return;
+      const cur = state.assets.findIndex((a) => a.id === seg.imageIds[i]);
+      seg.imageIds[i] = state.assets[(cur + 1) % state.assets.length].id;
     }
-  } else {
-    const i = slotIndex;
-    if (i < 0 || i >= seg.imageIds.length) return;
-    const cur = state.assets.findIndex((a) => a.id === seg.imageIds[i]);
-    seg.imageIds[i] = state.assets[(cur + 1) % state.assets.length].id;
-  }
-  state.renderers.clear();
-  renderThumbs(); renderSegs(); rebuild();
+    state.renderers.clear();
+    renderThumbs(); renderSegs(); rebuild();
+  });
 }
 
 async function genVoice(seg) {
@@ -1000,6 +1053,135 @@ function renderChips() {
   });
 }
 
+// ── 撤销/重做 ──────────────────────────────────────────
+//
+// 快照只存「编排」这一层：段的顺序与内容、素材的顺序。
+// 笔触、音频、渲染器缓存这些重资产不进快照——它们由对应 id 索引，
+// 素材顺序变了 index 自然跟着变。
+//
+// 素材本身按引用存（不是深拷贝）：一张图 2MB，深拷贝两次就没法用了。
+// 所有素材都留在 assetPool 里不删，删掉的只是「不在列表中」，
+// 这样撤销一次删除能把图原样放回去。
+
+/** 所有加载过的素材，永不删除（撤销删除要用） */
+const assetPool = new Map();
+
+/** 拍一张当前编排状态的快照 */
+function snapshotState() {
+  return {
+    segs: state.segs.map((s) => ({
+      id: s.id,
+      paragraphs: [...s.paragraphs],
+      imageIds: [...s.imageIds],
+      weights: [...s.weights],
+      capPos: s.capPos,
+      manualMs: s.manualMs,
+      audio: s.audio,          // AudioBuffer 不可克隆，按引用存
+      status: s.status,
+    })),
+    assets: state.assets.map((a) => a.id),   // 素材顺序（按 id 存）
+  };
+}
+
+/** 把 state 恢复到一份快照 */
+function restoreState(snap) {
+  if (!snap) return;
+  // 段：按 id 匹配回来，多余的删掉，缺的补上
+  const byId = new Map(state.segs.map((s) => [s.id, s]));
+  const next = [];
+  for (const s of snap.segs) {
+    const cur = byId.get(s.id);
+    if (cur) {
+      cur.paragraphs = [...s.paragraphs];
+      cur.imageIds = [...s.imageIds];
+      cur.weights = [...s.weights];
+      cur.capPos = s.capPos;
+      cur.manualMs = s.manualMs;
+      cur.audio = s.audio;
+      cur.status = s.status;
+      next.push(cur);
+    } else {
+      next.push(makeSeg({
+        id: s.id,
+        paragraphs: s.paragraphs,
+        imageIds: s.imageIds,
+        weights: s.weights,
+        capPos: s.capPos,
+        manualMs: s.manualMs,
+        audio: s.audio,
+      }));
+    }
+  }
+  state.segs = next;
+
+  // 素材：按快照里的顺序恢复
+  const ordered = snap.assets.map((id) => assetPool.get(id)).filter(Boolean);
+  state.assets = ordered;
+
+  state.renderers.clear();
+  renderThumbs();
+  renderSegs();
+  rebuild();
+  scenePanel?.render();
+  timelineView?.render();
+}
+
+/** 在撤销栈里跑一个会改状态的操作 */
+function undoable(label, fn, coalesceKey = null) {
+  return undoStack ? undoStack.run(label, fn, coalesceKey) : fn();
+}
+
+function initUndo() {
+  undoStack = new UndoStack({
+    capture: snapshotState,
+    restore: restoreState,
+    onChange: (info) => {
+      const u = $('undoBtn');
+      const r = $('redoBtn');
+      if (u) {
+        u.disabled = !info.canUndo;
+        u.title = info.canUndo ? `撤销：${info.undoLabel}（Ctrl+Z）` : '没有可撤销的操作';
+      }
+      if (r) {
+        r.disabled = !info.canRedo;
+        r.title = info.canRedo ? `重做：${info.redoLabel}（Ctrl+Shift+Z）` : '没有可重做的操作';
+      }
+    },
+  });
+  undoStack.emit();
+}
+
+/** 顶栏的撤销/重做按钮 + 快捷键 */
+function bindUndoUI() {
+  $('undoBtn')?.addEventListener('click', () => {
+    const label = undoStack?.undo();
+    if (label) hint(`已撤销：${label}`, 'info');
+    else hint('没有可撤销的操作', 'warn');
+  });
+  $('redoBtn')?.addEventListener('click', () => {
+    const label = undoStack?.redo();
+    if (label) hint(`已重做：${label}`, 'info');
+    else hint('没有可重做的操作', 'warn');
+  });
+
+  document.addEventListener('keydown', (e) => {
+    if (!(e.ctrlKey || e.metaKey)) return;
+    const k = e.key.toLowerCase();
+    if (k !== 'z' && k !== 'y') return;
+    // 在输入框里按 Ctrl+Z 是「撤销这次输入」，不能抢
+    const t = e.target;
+    if (t && (t.tagName === 'TEXTAREA' || t.tagName === 'INPUT' || t.isContentEditable)) return;
+    e.preventDefault();
+    if (k === 'y' || e.shiftKey) {
+      const label = undoStack?.redo();
+      hint(label ? `已重做：${label}` : '没有可重做的操作', label ? 'info' : 'warn');
+    } else {
+      const label = undoStack?.undo();
+      hint(label ? `已撤销：${label}` : '没有可撤销的操作', label ? 'info' : 'warn');
+    }
+  });
+}
+
 // ── 底部时间轴 ──────────────────────────────────────
 function initTimelineView() {
   const el = $('timeline');
@@ -1088,10 +1270,25 @@ function initScenePanel() {
     onDuration: (segId, ms) => {
       const seg = state.segs.find((s) => s.id === segId);
       if (!seg) return;
+      // 拖动过程中面板会连续调，这里只改值不记历史
       seg.manualMs = ms == null ? null : Math.round(ms);
       rebuild();
-      renderSegs();
-      scenePanel?.render();
+      if (!panelEditing) scenePanel?.render();
+    },
+    onDurationEnd: (segId, ms, beforeMs) => {
+      const seg = state.segs.find((s) => s.id === segId);
+      if (!seg) return;
+      const target = ms == null ? null : Math.round(ms);
+      const before = beforeMs == null ? null : Math.round(beforeMs);
+      if (before === target) return;
+      // 撤销要回到「拖动前」的值，不是「松手前一刻」的值
+      undoStack?.runWithBefore('改这一屏的时长', () => {
+        seg.manualMs = target;
+        rebuild();
+      }, (snap) => ({
+        ...snap,
+        segs: snap.segs.map((s) => (s.id === segId ? { ...s, manualMs: before } : s)),
+      }));
     },
     onVoice: (segId) => {
       const seg = state.segs.find((s) => s.id === segId);
@@ -1405,6 +1602,8 @@ if (new URLSearchParams(location.search).has('debug')) {
     addFiles, splitScript,
     makeSeg, splitSegAt, mergeSegWithPrev, mergeSegWithNext,
     reorderSeg, reorderAssets, removeAsset, removeSeg, cycleAsset, setSegImages, setSegCaptions,
+    undoDepth: () => (undoStack ? undoStack.past.length : 0),
+    undoLabel: () => (undoStack ? undoStack.undoLabel() : ''),
   };
 }
 

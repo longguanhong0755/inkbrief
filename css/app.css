@@ -51,6 +51,11 @@ input, select, textarea { font: inherit; color: inherit; }
 .brand .mark { font-size: 18px; font-weight: 700; letter-spacing: .2px; }
 .brand .tag { color: var(--muted); font-size: 12.5px; }
 .top-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+/* 撤销/重做：并排一组，视觉上是一对 */
+.undo-group { display: inline-flex; gap: 4px; }
+.undo-group button { padding: 7px 11px; font-size: 12.5px; }
+.undo-group button:disabled { opacity: .4; cursor: not-allowed; }
+.undo-group button:disabled:hover { border-color: var(--line); color: var(--ink); }
 /* 只给顶栏的 label 用；.seg.sel / .tl-block.sel 是「选中态」，不能继承这行 */
 label.sel { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12.5px; }
 label.sel select {
