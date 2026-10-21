@@ -86,3 +86,21 @@ onnx.save(convert_float_to_float16(m, keep_io_types=True, disable_shape_infer=Tr
 # 浏览器实测
 node dev/test_ort_browser.mjs
 ```
+
+## 落地结果（2026-10-21）
+
+上面两条待定项已定并实现：
+
+| 决策 | 结果 |
+|---|---|
+| 音色数量 | **1 个模型 + 2 组参数预设**（温柔 / 利落）。同一个说话人，靠 `length_scale` / `noise_scale` / `noise_w` 改变语速与起伏，体积只算一份 |
+| 英文 | **不做**。Piper 英文最小 60MB（fp16 30MB），超出「单语言 <10MB」，换架构又无法复用中文管线 |
+| int8 | **放弃**。体积 7.59MB 但 onnxruntime-web 缺 `ConvInteger` 实现，浏览器跑不起来；原生 CPU 上也慢 10 倍 |
+| 音素化 | 不引 espeak 运行时（24MB / GPL），改为**离线生成映射表**：espeak 对 2 万字逐个音素化 → 按「拼音+声调」取众数 → 1286 条表（27KB）。运行时 pinyin-pro 判多音字后查表 |
+
+**声调的真相**：espeak 的普通话只用 `ɜ` 后缀标记**阳平（二声）**，一/三/四声在音素层面完全相同。所以这个模型的输入里根本没有完整的声调信息，听感会有一点「洋腔」。这是模型的先天限制，不是实现问题。
+
+**音素表的准确度**：按「拼音+声调」分组后，同组内众数一致度 86.8%（不分组只有 71.7%），说明声调确实是靠 `ɜ` 编码的。
+
+最终产物：`assets/tts/zh-huayan-fp16.onnx`（10.1MB）+ `assets/tts/zh-phonemes.json`（27KB）+ `js/vendor/ort/`（11.2MB wasm）。首屏合计 21.8MB。
+
