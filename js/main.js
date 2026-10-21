@@ -1,567 +1,808 @@
-import { planScenes } from './core/scene-planner.js';
-import { buildTimeline, frameAt } from './core/timeline.js';
+// inkbrief 主逻辑：多图 + 多段 → 逐屏手绘 + 本地 TTS 配音 + 字幕 → 导出 MP4。
 import { StrokeRenderer } from './core/renderer.js';
-import { Compositor } from './core/compositor.js';
+import { Compositor, computeLayout } from './core/compositor.js';
 import { CaptionPainter } from './core/subtitle.js';
-import { exportVideo } from './core/exporter.js';
+import {
+  buildTimeline, sceneAt, drawProgress, estimateDurationMs,
+} from './core/timeline.js';
+import { TTSEngine, VOICES } from './tts/engine.js';
+import { buildSoundtrack, toAudioBuffer } from './audio/mix.js';
+import { exportVideo, downloadBlob, pickMime } from './core/exporter.js';
 
 const $ = (id) => document.getElementById(id);
-const MAXSIDE = 1024;
-const MAX_SEG = 8;
+const MAX_SEGS = 12;
+const MAX_EDGE = 1600;
+// maxStrokes 直接决定渲染负担：每屏只有两三秒，笔数给太多必然卡。
+// 实测单笔渲染约 0.5~1ms，5000 笔刚好铺满一屏且能跑满 30fps。
+const PIPE_OPTS = { colors: 0, style: 'marker', detail: 1, targetSec: 240, maxStrokes: 5000, dropDead: false, returnKeys: false };
+const FONT_NAME = 'MaShanZheng';
+const KAI = '"KaiTi", "STKaiti", "楷体", serif';
 
-let imgCanvas = null;
-let W = 0, H = 0;
-let strokes = null, clips = null, layers = null;
-let plan = null, timeline = null;
-let renderer = null, compositor = null, captions = null;
-let playing = false, currentMs = 0, lastT = 0, raf = 0;
-let exporting = false, abortCtl = null;
-let worker = null, workerBusy = false, jobSeq = 0, jobNow = 0;
-let paragraphsNow = [];
-let pendingParagraphs = [];
-let fontFamily = '"MaShanZheng", "KaiTi", "STKaiti", "楷体", serif';
-let fontOk = false;
+const state = {
+  assets: [],
+  segs: [],
+  timeline: null,
+  renderers: new Map(),
+  tts: null,
+  ttsReady: false,
+  playing: false,
+  ms: 0,
+  W: 1920,
+  H: 1080,
+  voiceId: VOICES[0].id,
+  audioCtx: null,
+  srcNode: null,
+  playStart: 0,
+  playFrom: 0,
+  exportSignal: null,
+  busy: false,
+  mix: null,
+  fontOk: false,
+};
 
+let worker = null;
+let jobSeq = 0;
+const pendingJobs = new Map();
+let compositor = null;
+let painter = null;
+const stage = $('stage');
+
+// ── 小工具 ────────────────────────────────────────────
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const fmt = (ms) => (ms / 1000).toFixed(1) + 's';
+const uid = () => Math.random().toString(36).slice(2, 9);
+const nextFrame = () => new Promise((r) => requestAnimationFrame(() => r()));
 
-function showMsg(text, ok = false) {
-  const el = $('msg');
+function hint(msg, kind = 'info') {
+  const el = $('previewHint');
+  if (!el) return;
+  if (!msg) { el.hidden = true; el.textContent = ''; return; }
   el.hidden = false;
-  el.textContent = text;
-  el.classList.toggle('ok', !!ok);
+  el.textContent = msg;
+  el.style.color = kind === 'warn' ? 'var(--accent)' : 'var(--muted)';
 }
 
-function hideMsg() { $('msg').hidden = true; }
+// ── 启动 ──────────────────────────────────────────────
+async function boot() {
+  buildVoiceOptions();
+  bindUI();
+  ensureCanvas();
+  loadFont();
+  initWorker();
 
-function fmt(sec) {
-  const s = Math.max(0, Math.round(sec));
-  return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
-}
+  const engine = new TTSEngine();
+  state.tts = engine;
 
-function stamp() {
-  const d = new Date();
-  const p = (n) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
-}
+  const bootEl = $('boot');
+  const bar = $('bootBar');
+  const text = $('bootText');
+  const skip = $('bootSkip');
 
-// ---------------- 文案 ----------------
-function readParagraphs() {
-  return $('text').value
-    .split(/\n\s*\n/)
-    .map((s) => s.replace(/\s+/g, ' ').trim())
-    .filter(Boolean);
-}
+  let cancelled = false;
+  skip.addEventListener('click', () => {
+    cancelled = true;
+    bootEl.hidden = true;
+    hint('已跳过语音引擎。没有配音也能出片，只是时长按字数估。需要配音时刷新页面。', 'warn');
+  });
 
-function updateCounts() {
-  const ps = readParagraphs();
-  paragraphsNow = ps;
-  $('segInfo').textContent = `${ps.length} 段`;
-  $('charInfo').textContent = `${ps.reduce((a, s) => a + [...s].length, 0)} 字`;
-  $('go').disabled = !imgCanvas || ps.length === 0 || ps.length > MAX_SEG;
-  if (ps.length > MAX_SEG) showMsg(`最多 ${MAX_SEG} 段，请把后面的并进上一段。`);
-  else if ($('msg').textContent.startsWith('最多')) hideMsg();
-}
-
-// ---------------- 图片 ----------------
-function fitImage(img) {
-  let w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
-  const s = Math.min(1, MAXSIDE / Math.max(w, h));
-  w = Math.max(8, Math.round(w * s));
-  h = Math.max(8, Math.round(h * s));
-  const c = document.createElement('canvas');
-  c.width = w; c.height = h;
-  const x = c.getContext('2d');
-  x.imageSmoothingEnabled = true;
-  x.imageSmoothingQuality = 'high';
-  x.fillStyle = '#ffffff';
-  x.fillRect(0, 0, w, h);
-  x.drawImage(img, 0, 0, w, h);
-  return c;
-}
-
-function useImage(img, url) {
-  clearPreview();
-  imgCanvas = fitImage(img);
-  W = imgCanvas.width; H = imgCanvas.height;
-  const thumb = $('thumb');
-  thumb.src = url;
-  thumb.hidden = false;
-  $('dropHint').hidden = true;
-  $('empty').hidden = false;
-  $('empty').querySelector('.empty-title').textContent = '这边会出现一支手绘讲解视频';
-  $('empty').querySelector('.empty-sub').textContent = '写好文案，点“生成预览”';
-  hideMsg();
-  updateCounts();
-  setStatus('图片已就绪。');
-}
-
-function loadFile(file) {
-  if (!file || !/^image\//.test(file.type)) { showMsg('请选择一张图片。'); return; }
-  const url = URL.createObjectURL(file);
-  const img = new Image();
-  img.onload = () => { useImage(img, url); };
-  img.onerror = () => { URL.revokeObjectURL(url); showMsg('这张图打不开，换一张试试。'); };
-  img.src = url;
-}
-
-async function loadSample(which) {
-  const file = which === 'poster' ? 'samples/sample-3.jpg'
-    : which === 'photo' ? 'samples/sample-2.jpg'
-      : 'samples/sample-1.jpg';
-  const text = which === 'poster'
-    ? '1927 年，一封航空邮件\n\n红色飞机划过深蓝色的天\n\nfirst to arrive，先到先被看见\n\n用航空邮件，半盎司一角钱'
-    : which === 'photo'
-      ? '一只猫在舔爪子\n\n它低着头，很专心\n\n照片比插画更难画得像'
-      : '一只圆脸小猫\n\n粉色的耳朵和腮红\n\n它正眯着眼睛笑\n\n看起来很开心';
-  $('text').value = text;
-  updateCounts();
   try {
-    const img = new Image();
-    img.src = file;
-    await img.decode();
-    useImage(img, file);
-  } catch (e) {
-    showMsg('示例图加载失败，请手动选一张图。');
-  }
-}
-
-// ---------------- 状态 ----------------
-function setStatus(text) {
-  $('stats').textContent = text;
-}
-
-function showEmpty(title, sub) {
-  $('empty').hidden = false;
-  $('empty').querySelector('.empty-title').textContent = title;
-  $('empty').querySelector('.empty-sub').textContent = sub;
-}
-
-function clearPreview() {
-  stop();
-  currentMs = 0;
-  $('play').textContent = '播放';
-  $('play').disabled = true;
-  $('seek').disabled = true;
-  $('export').disabled = true;
-  $('seek').value = 0;
-  $('clock').textContent = '0:00 / 0:00';
-  $('scenes').innerHTML = '';
-  $('mapInfo').textContent = '生成后显示“第几段对应哪一块”。';
-  const c = $('map').getContext('2d');
-  c.clearRect(0, 0, 320, 180);
-  setStatus('还没有生成。');
-  $('modeNote').textContent = '';
-}
-
-// ---------------- 生成 ----------------
-function newWorker() {
-  if (worker) { try { worker.terminate(); } catch (e) { /* ignore */ } }
-  worker = new Worker('js/worker.js?v=4');
-  worker.onmessage = onWorker;
-  worker.onerror = (e) => {
-    workerBusy = false;
-    $('genStage').hidden = true;
-    $('go').disabled = false;
-    showMsg('引擎出错：' + (e.message || '未知错误'));
-  };
-  workerBusy = false;
-}
-
-function generate() {
-  if (!imgCanvas) { showMsg('先选一张图。'); return; }
-  const ps = readParagraphs();
-  if (!ps.length) { showMsg('至少写一段文案。'); return; }
-  if (ps.length > MAX_SEG) { showMsg(`最多 ${MAX_SEG} 段。`); return; }
-
-  clearPreview();
-  hideMsg();
-  paragraphsNow = ps;
-  pendingParagraphs = ps;
-  $('go').disabled = true;
-  $('genStage').hidden = false;
-  $('genBar').style.width = '0%';
-  $('genMsg').textContent = '正在提炼笔触…';
-  showEmpty('正在提炼…', '图片只在本机处理，第一次大约 10~40 秒。');
-
-  if (!worker || workerBusy) newWorker();
-  workerBusy = true;
-  jobNow = ++jobSeq;
-
-  const detail = parseInt($('detail').value, 10);
-  const opts = {
-    colors: parseInt($('colors').value, 10) || 0,
-    style: $('style').value,
-    detail,
-    targetSec: detail === 0 ? 120 : (detail === 2 ? 480 : 240),
-    debug: true,
-    dropDead: false,
-    returnKeys: false,
-  };
-  const data = imgCanvas.getContext('2d').getImageData(0, 0, W, H).data;
-  const copy = new Uint8ClampedArray(data);
-  worker.postMessage({ jobId: jobNow, px: copy.buffer, W, H, opts }, [copy.buffer]);
-}
-
-function onWorker(e) {
-  const d = e.data || {};
-  if (d.jobId !== jobNow) return;
-  if (d.type === 'progress') {
-    const p = clamp(d.p || 0, 0, 1);
-    $('genBar').style.width = (p * 100).toFixed(0) + '%';
-    if (d.msg) $('genMsg').textContent = d.msg;
-    return;
-  }
-  workerBusy = false;
-  if (d.type === 'error') {
-    $('genStage').hidden = true;
-    $('go').disabled = false;
-    showEmpty('没有生成出来', '换个参数或换张图再试。');
-    showMsg('引擎出错：' + d.msg);
-    return;
-  }
-  if (d.type === 'done') {
-    try {
-      onDone(d.res);
-    } catch (err) {
-      console.error(err);
-      $('genStage').hidden = true;
-      $('go').disabled = false;
-      showMsg('生成结果处理失败：' + (err.message || err));
+    await engine.load((p) => {
+      if (cancelled) return;
+      bar.style.width = Math.round(clamp(p.ratio, 0, 1) * 100) + '%';
+      text.textContent = p.text || '加载中…';
+    });
+    if (!cancelled) {
+      state.ttsReady = true;
+      bar.style.width = '100%';
+      text.textContent = '就绪';
+      await new Promise((r) => setTimeout(r, 240));
+      bootEl.hidden = true;
+    }
+  } catch (err) {
+    if (!cancelled) {
+      text.textContent = '语音引擎加载失败：' + (err.message || err) + '。仍然可以手动画，只是没有配音。';
+      text.style.color = 'var(--accent)';
+      skip.textContent = '不加载了，直接开始';
     }
   }
+  renderSegs();
+  refreshGenButton();
 }
 
-function onDone(res) {
-  strokes = res.strokes;
-  clips = res.clips;
-  layers = res.layers;
-  W = res.W; H = res.H;
-  paragraphsNow = pendingParagraphs.length ? pendingParagraphs : readParagraphs();
-
-  plan = planScenes({ W, H, strokes, clips, layers }, { paragraphs: paragraphsNow.length });
-  timeline = buildTimeline({ plan, strokes, paragraphs: paragraphsNow, W, H });
-  renderer = new StrokeRenderer({ W, H, strokes, clips, order: timeline.order });
-  compositor = new Compositor({ W: 1280, H: 720, imageW: W, imageH: H, canvas: $('cv') });
-  captions = new CaptionPainter({ family: fontFamily });
-  captions.prepare(timeline);
-
-  $('genStage').hidden = true;
-  $('go').disabled = false;
-  $('empty').hidden = true;
-  $('play').disabled = false;
-  $('seek').disabled = false;
-  $('export').disabled = false;
-  currentMs = 0;
-  renderAt(0);
-
-  const sec = timeline.totalMs / 1000;
-  const where = plan.mode === 'zones'
-    ? `${timeline.scenes.length} 个出场区块 · 分区依次出场`
-    : `整图播放（字幕按段换）`;
-  setStatus(`共 ${strokes.length} 笔 · ${where} · 约 ${sec.toFixed(0)} 秒`);
-  $('modeNote').textContent = plan.mode === 'flat'
-    ? '这张图的层互相压得太密，分不出干净的区域，已按整图播放（字幕仍按段换）。'
-    : (plan.stats.changedUnits ? '为保持遮挡关系，有 ' + plan.stats.changedUnits + ' 个图层并到了相邻区块。' : '');
-  if (!fontOk) $('modeNote').textContent += ' 手写字体没加载成功，已回退系统楷体。';
-
-  buildSceneChips();
-  drawMap();
-
-  // 自动开播，让人一眼看到“讲到哪画到哪”
-  setTimeout(() => { if (!playing) play(); }, 500);
+function loadFont() {
+  if (!document.fonts) return;
+  document.fonts.load(`40px "${FONT_NAME}"`).then(() => {
+    if (document.fonts.check(`40px "${FONT_NAME}"`)) {
+      state.fontOk = true;
+      if (painter) {
+        painter.setFamily(`"${FONT_NAME}", ${KAI}`);
+        if (state.timeline) renderAt(state.ms);
+      }
+    }
+  }).catch(() => {});
 }
 
-// ---------------- 回放 ----------------
-function renderAt(ms) {
-  if (!timeline || !renderer || !compositor) return;
-  currentMs = clamp(ms, 0, timeline.totalMs);
-  renderer.seek(timeline, currentMs);
-  const cap = captions ? captions.draw(timeline, currentMs) : null;
-  compositor.draw({
-    painted: renderer.painted,
-    partial: renderer.getPartial(),
-    captionCanvas: cap,
-    tip: renderer.tip,
-    showTip: true,
+function buildVoiceOptions() {
+  const sel = $('voice');
+  sel.innerHTML = '';
+  for (const v of VOICES) {
+    const o = document.createElement('option');
+    o.value = v.id;
+    o.textContent = v.name;
+    o.title = v.desc;
+    sel.appendChild(o);
+  }
+  sel.value = state.voiceId;
+  sel.addEventListener('change', () => {
+    state.voiceId = sel.value;
+    for (const s of state.segs) if (s.audio) { s.audio = null; s.status = 'idle'; }
+    renderSegs();
+    rebuild();
   });
-  $('clock').textContent = `${fmt(currentMs / 1000)} / ${fmt(timeline.totalMs / 1000)}`;
-  if (document.activeElement !== $('seek')) $('seek').value = String(Math.round(1000 * currentMs / timeline.totalMs));
-  let active = -1;
-  for (let i = 0; i < timeline.scenes.length; i++) {
-    const s = timeline.scenes[i];
-    if (currentMs >= s.start - 1 && currentMs <= s.end + 1) { active = i; break; }
+}
+
+const voiceOf = (id = state.voiceId) => VOICES.find((v) => v.id === id) || VOICES[0];
+
+// ── 管线 worker ───────────────────────────────────────
+function initWorker() {
+  try {
+    worker = new Worker('js/worker.js');
+    worker.onmessage = (e) => {
+      const d = e.data || {};
+      const job = pendingJobs.get(d.jobId);
+      if (!job) return;
+      if (d.type === 'progress') job.onProgress?.(d.p, d.msg);
+      else if (d.type === 'done') { pendingJobs.delete(d.jobId); job.resolve(d.res); }
+      else if (d.type === 'error') { pendingJobs.delete(d.jobId); job.reject(new Error(d.msg)); }
+    };
+    worker.onerror = (e) => {
+      for (const [, j] of pendingJobs) j.reject(new Error('管线异常：' + (e.message || '未知')));
+      pendingJobs.clear();
+    };
+  } catch (err) {
+    hint('无法启动笔触引擎：' + err.message, 'warn');
   }
-  [...$('scenes').children].forEach((b, i) => b.classList.toggle('on', i === active));
 }
 
-function play() {
-  if (!timeline || exporting) return;
-  if (currentMs >= timeline.totalMs - 20) {
-    currentMs = 0;
-    renderer.reset();
-    renderAt(0);
+function runPipeline(px, W, H, onProgress) {
+  return new Promise((resolve, reject) => {
+    if (!worker) return reject(new Error('笔触引擎未就绪'));
+    const jobId = ++jobSeq;
+    pendingJobs.set(jobId, { resolve, reject, onProgress });
+    worker.postMessage({ jobId, px: px.buffer, W, H, opts: PIPE_OPTS }, [px.buffer]);
+  });
+}
+
+// ── 素材 ──────────────────────────────────────────────
+async function addFiles(files) {
+  const list = [...files].filter((f) => /^image\//.test(f.type));
+  if (!list.length) { hint('这些文件不是图片。', 'warn'); return; }
+  for (const f of list) {
+    try {
+      const img = await loadImage(f);
+      const scaled = scaleTo(img, MAX_EDGE);
+      state.assets.push({
+        id: uid(),
+        name: f.name.replace(/\.[^.]+$/, ''),
+        el: scaled.canvas,
+        w: scaled.w,
+        h: scaled.h,
+        url: scaled.canvas.toDataURL('image/jpeg', 0.8),
+        strokes: null,
+        clips: null,
+        pipelineMs: 0,
+      });
+    } catch (err) {
+      hint(`「${f.name}」读不了：` + err.message, 'warn');
+    }
   }
-  playing = true;
-  $('play').textContent = '暂停';
-  lastT = performance.now();
-  cancelAnimationFrame(raf);
-  raf = requestAnimationFrame(tick);
+  renderThumbs();
+  autoBind();
+  renderSegs();
+  refreshGenButton();
 }
 
-function stop() {
-  playing = false;
-  cancelAnimationFrame(raf);
-  const b = $('play');
-  if (b) b.textContent = currentMs >= (timeline ? timeline.totalMs : 0) - 20 ? '重播' : '播放';
+function loadImage(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('图片解码失败')); };
+    img.src = url;
+  });
 }
 
-function tick(now) {
-  if (!playing) return;
-  const dt = Math.min(100, now - lastT);
-  lastT = now;
-  currentMs = Math.min(timeline.totalMs, currentMs + dt);
-  renderAt(currentMs);
-  if (currentMs >= timeline.totalMs) {
-    playing = false;
-    $('play').textContent = '重播';
+function scaleTo(img, maxEdge) {
+  const w0 = img.naturalWidth || img.width;
+  const h0 = img.naturalHeight || img.height;
+  const s = Math.min(1, maxEdge / Math.max(w0, h0));
+  const w = Math.max(2, Math.round(w0 * s));
+  const h = Math.max(2, Math.round(h0 * s));
+  const cv = document.createElement('canvas');
+  cv.width = w; cv.height = h;
+  const x = cv.getContext('2d', { willReadFrequently: true });
+  x.imageSmoothingQuality = 'high';
+  x.drawImage(img, 0, 0, w, h);
+  return { canvas: cv, w, h };
+}
+
+function renderThumbs() {
+  const box = $('thumbs');
+  box.innerHTML = '';
+  state.assets.forEach((a, i) => {
+    const used = state.segs.some((s) => s.assetId === a.id);
+    const d = document.createElement('div');
+    d.className = 'thumb' + (used ? ' used' : '');
+    d.innerHTML = `<img src="${a.url}" alt=""><span class="no">${i + 1}</span><button class="del" title="移除">×</button>`;
+    d.querySelector('.del').addEventListener('click', (e) => {
+      e.preventDefault();
+      state.assets = state.assets.filter((x) => x.id !== a.id);
+      for (const s of state.segs) if (s.assetId === a.id) s.assetId = null;
+      state.renderers.clear();
+      renderThumbs(); renderSegs(); rebuild();
+    });
+    box.appendChild(d);
+  });
+  $('assetHint').textContent = state.assets.length
+    ? `${state.assets.length} 张图。段和图怎么对应，在中间每段的「图 N」按钮上点一下就能换。`
+    : '';
+  $('dropText').innerHTML = state.assets.length
+    ? '继续添加图片<br><small>可一次多选</small>'
+    : '拖入图片，或点这里选择<br><small>可一次多选，顺序即出场顺序</small>';
+}
+
+// ── 文案 ──────────────────────────────────────────────
+function splitScript() {
+  const raw = $('rawScript').value.trim();
+  if (!raw) { hint('先把文案粘进来。', 'warn'); return; }
+  let parts = raw.split(/\n\s*\n+/).map((s) => s.replace(/\s+/g, ' ').trim()).filter(Boolean);
+  if (parts.length === 1) {
+    const sents = raw.split(/(?<=[。！？])/).map((s) => s.trim()).filter(Boolean);
+    if (sents.length > 1 && sents.length <= MAX_SEGS) parts = sents;
+  }
+  if (parts.length > MAX_SEGS) {
+    const head = parts.slice(0, MAX_SEGS - 1);
+    const rest = parts.slice(MAX_SEGS - 1).join(' ');
+    parts = [...head, rest];
+    hint(`超过 ${MAX_SEGS} 段，后面几段已合并到最后一段。`, 'warn');
+  }
+  state.segs = parts.map((text) => ({
+    id: uid(), text, assetId: null, audio: null, status: 'idle', manualMs: null,
+  }));
+  state.renderers.clear();
+  autoBind();
+  renderSegs();
+  rebuild();
+  refreshGenButton();
+}
+
+function autoBind() {
+  state.segs.forEach((s, i) => {
+    if (s.assetId && state.assets.some((a) => a.id === s.assetId)) return;
+    s.assetId = state.assets.length ? state.assets[Math.min(i, state.assets.length - 1)].id : null;
+  });
+}
+
+function segDuration(seg) {
+  const manual = Number(seg.manualMs);
+  if (manual > 0) return Math.round(manual);
+  if (seg.audio && seg.audio.duration) return Math.round(seg.audio.duration * 1000);
+  return estimateDurationMs(seg.text);
+}
+
+function renderSegs() {
+  const box = $('segs');
+  if (!state.segs.length) {
+    box.innerHTML = '<p class="empty">还没有分段。粘稿子后点「按空行分段」。</p>';
     return;
   }
-  raf = requestAnimationFrame(tick);
+  const focused = document.activeElement;
+  const focusId = focused && focused.dataset?.segid;
+  const caret = focused && focused.selectionStart;
+  box.innerHTML = '';
+
+  state.segs.forEach((seg, i) => {
+    const asset = state.assets.find((a) => a.id === seg.assetId);
+    const el = document.createElement('div');
+    el.className = 'seg' + (asset ? '' : ' unbound');
+
+    const audioPill = seg.status === 'busy'
+      ? '<span class="pill">生成中…</span>'
+      : seg.audio
+        ? `<span class="pill ok">配音 ${seg.audio.duration.toFixed(1)}s</span>`
+        : seg.status === 'stale'
+          ? '<span class="pill warn">文案改过，需重配</span>'
+          : '<span class="pill">无配音</span>';
+
+    const dur = segDuration(seg);
+    const audioMs = seg.audio ? Math.round(seg.audio.duration * 1000) : 0;
+    const lo = Math.round(audioMs ? audioMs * 0.55 : Math.min(dur * 0.5, 6000));
+    const hi = Math.round(audioMs ? Math.max(audioMs * 2, 2000) : Math.max(dur * 2, 6000));
+    const val = Math.round(clamp(dur, lo, hi));
+    const speedTxt = audioMs ? (audioMs / dur).toFixed(2) + '×' : '';
+
+    el.innerHTML = `
+      <div class="seg-head">
+        <span class="seg-no">${i + 1}</span>
+        <span class="wc">${seg.text.replace(/\s/g, '').length} 字</span>
+        <span class="right">${audioPill}</span>
+      </div>
+      <textarea rows="2" data-segid="${seg.id}" placeholder="这一段要讲的话">${escapeHtml(seg.text)}</textarea>
+      <div class="seg-bar">
+        <button class="pick ${asset ? '' : 'none'}" type="button">
+          ${asset ? `<img src="${asset.url}" alt="">图 ${state.assets.indexOf(asset) + 1}` : '选择配图'}
+        </button>
+        <button class="ghost voice-btn" type="button" ${state.ttsReady ? '' : 'disabled'}>
+          ${seg.audio ? '重配' : '配音'}
+        </button>
+        <label class="speed" title="拖动改变这一屏的时长；配音会自动变速来匹配">
+          <input type="range" min="${lo}" max="${hi}" value="${val}" step="50">
+          <span class="val">${(dur / 1000).toFixed(1)}s${speedTxt ? ` · ${speedTxt}` : ''}</span>
+        </label>
+      </div>
+    `;
+
+    const ta = el.querySelector('textarea');
+    ta.addEventListener('input', () => {
+      seg.text = ta.value;
+      el.querySelector('.wc').textContent = `${ta.value.replace(/\s/g, '').length} 字`;
+      if (seg.audio) {
+        seg.status = 'stale';
+        const pill = el.querySelector('.seg-head .right');
+        if (pill) pill.innerHTML = '<span class="pill warn">文案改过，需重配</span>';
+      }
+      clearTimeout(seg._t);
+      seg._t = setTimeout(() => rebuild(), 600);
+    });
+
+    el.querySelector('.pick').addEventListener('click', () => cycleAsset(seg));
+    el.querySelector('.voice-btn').addEventListener('click', () => genVoice(seg));
+
+    const slider = el.querySelector('input[type=range]');
+    const valEl = el.querySelector('.val');
+    slider.addEventListener('input', () => {
+      seg.manualMs = Number(slider.value);
+      const s = audioMs ? audioMs / seg.manualMs : 1;
+      valEl.textContent = `${(seg.manualMs / 1000).toFixed(1)}s${audioMs ? ` · ${s.toFixed(2)}×` : ''}`;
+      rebuild();
+    });
+
+    box.appendChild(el);
+  });
+
+  // 还原焦点
+  if (focusId) {
+    const again = box.querySelector(`textarea[data-segid="${focusId}"]`);
+    if (again) { again.focus(); try { again.setSelectionRange(caret, caret); } catch { /* ignore */ } }
+  }
 }
 
-// ---------------- 场景 / 地图 ----------------
-const PALETTE = ['#c4553b', '#d99a4e', '#5b8f74', '#6b7fa8', '#a06a9a', '#8a8a4f', '#b06a4a', '#4f8a9a'];
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
 
-function buildSceneChips() {
-  const box = $('scenes');
-  box.innerHTML = '';
-  timeline.scenes.forEach((s, i) => {
-    const b = document.createElement('button');
-    const t = s.paragraphs.map((p) => p.text).join(' / ');
-    b.textContent = `${i + 1}. ${t.length > 14 ? t.slice(0, 14) + '…' : t}`;
-    b.title = `跳到 ${fmt(s.start / 1000)}`;
-    b.onclick = () => {
-      const was = playing;
-      stop();
-      currentMs = s.start;
-      renderer.reset();
-      renderAt(currentMs);
-      if (was) { lastT = performance.now(); playing = true; $('play').textContent = '暂停'; raf = requestAnimationFrame(tick); }
+function cycleAsset(seg) {
+  if (!state.assets.length) { hint('先加图片。', 'warn'); return; }
+  const idx = state.assets.findIndex((a) => a.id === seg.assetId);
+  seg.assetId = state.assets[(idx + 1) % state.assets.length].id;
+  renderThumbs(); renderSegs(); rebuild();
+}
+
+async function genVoice(seg) {
+  if (!state.ttsReady) { hint('语音引擎还没就绪。', 'warn'); return; }
+  if (!seg.text.trim()) { hint('这段没有文字。', 'warn'); return; }
+  seg.status = 'busy';
+  renderSegs();
+  try {
+    const r = await state.tts.synth(seg.text, voiceOf());
+    if (!r.pcm.length) throw new Error('合成结果为空');
+    seg.audio = { pcm: r.pcm, sr: r.sampleRate, duration: r.pcm.length / r.sampleRate };
+    seg.status = 'done';
+    seg.manualMs = null;
+  } catch (err) {
+    seg.status = 'idle';
+    hint('配音失败：' + (err.message || err), 'warn');
+  }
+  renderSegs();
+  rebuild();
+}
+
+// ── 生成 ──────────────────────────────────────────────
+function refreshGenButton() {
+  const ok = state.segs.length > 0 && state.segs.some((s) => s.assetId);
+  $('genBtn').disabled = !ok;
+}
+
+async function generate() {
+  if (state.busy) return;
+  const segs = state.segs.filter((s) => s.assetId);
+  if (!segs.length) { hint('每段都要先配一张图。', 'warn'); return; }
+
+  state.busy = true;
+  const genBtn = $('genBtn');
+  genBtn.disabled = true;
+  genBtn.textContent = '生成中…';
+
+  try {
+    const need = [...new Set(segs.map((s) => s.assetId))];
+    let done = 0;
+    for (const id of need) {
+      const a = state.assets.find((x) => x.id === id);
+      if (!a) continue;
+      if (a.strokes) { done++; continue; }
+      hint(`正在分析图片 ${done + 1}/${need.length}：「${a.name}」`);
+      const ctx = a.el.getContext('2d', { willReadFrequently: true });
+      const img = ctx.getImageData(0, 0, a.w, a.h);
+      const px = new Uint8ClampedArray(img.data.buffer.slice(0));
+      const t0 = performance.now();
+      const res = await runPipeline(px, a.w, a.h, (p) => {
+        hint(`正在分析图片 ${done + 1}/${need.length}：「${a.name}」 ${Math.round((p || 0) * 100)}%`);
+      });
+      a.strokes = res.strokes;
+      a.clips = res.clips;
+      a.pipelineMs = performance.now() - t0;
+      done++;
+    }
+
+    rebuild();
+    const tl = state.timeline;
+    const notes = (tl.notes || []).slice(0, 2).join('；');
+    hint(`完成：${tl.scenes.length} 屏，总长 ${fmt(tl.totalMs)}。${notes}`);
+    genBtn.textContent = '重新生成';
+  } catch (err) {
+    hint('生成失败：' + (err.message || err), 'warn');
+    genBtn.textContent = '生成';
+  } finally {
+    state.busy = false;
+    genBtn.disabled = false;
+    refreshGenButton();
+  }
+}
+
+function rebuild() {
+  const segs = state.segs.filter((s) => s.assetId && state.assets.some((a) => a.id === s.assetId));
+  if (!segs.length) {
+    state.timeline = null;
+    $('chips').innerHTML = '';
+    $('stageEmpty').hidden = false;
+    $('playBtn').disabled = true;
+    $('seek').disabled = true;
+    $('stat').textContent = '';
+    $('expBtn').disabled = true;
+    return;
+  }
+
+  const mapped = segs.map((s) => {
+    const a = state.assets.find((x) => x.id === s.assetId);
+    return {
+      id: s.id, text: s.text, hasImage: !!a,
+      audioMs: s.audio ? s.audio.duration * 1000 : 0,
+      manualMs: s.manualMs,
+      strokeCount: a && a.strokes ? a.strokes.length : 0,
     };
+  });
+
+  state.timeline = buildTimeline(mapped);
+  state.timeline.scenes.forEach((sc) => {
+    const seg = state.segs.find((s) => s.id === sc.id);
+    sc.assetId = seg ? seg.assetId : null;
+    sc.text = seg ? seg.text : '';
+  });
+
+  const validIds = new Set(state.timeline.scenes.map((s) => s.id));
+  for (const key of [...state.renderers.keys()]) if (!validIds.has(key)) state.renderers.delete(key);
+
+  $('stageEmpty').hidden = true;
+  $('playBtn').disabled = false;
+  $('seek').disabled = false;
+  $('stat').textContent = `${state.timeline.scenes.length} 屏 · ${fmt(state.timeline.totalMs)}`;
+  $('expBtn').disabled = !state.timeline.totalMs;
+
+  renderChips();
+  state.ms = Math.min(state.ms, state.timeline.totalMs);
+  renderAt(state.ms);
+  updateTransport();
+}
+
+function renderChips() {
+  const box = $('chips');
+  box.innerHTML = '';
+  if (!state.timeline) return;
+  state.timeline.scenes.forEach((sc, i) => {
+    const b = document.createElement('button');
+    b.className = 'chip';
+    b.type = 'button';
+    b.textContent = `${i + 1} · ${fmt(sc.dur)}`;
+    b.addEventListener('click', () => {
+      pause();
+      state.ms = sc.start;
+      renderAt(state.ms);
+      updateTransport();
+    });
     box.appendChild(b);
   });
 }
 
-function drawMap() {
-  const cv = $('map');
-  const ctx = cv.getContext('2d');
-  const w = cv.width, h = cv.height;
-  ctx.clearRect(0, 0, w, h);
-  ctx.fillStyle = '#ffffff';
-  ctx.fillRect(0, 0, w, h);
-  const pad = 10;
-  const s = Math.min((w - pad * 2) / W, (h - pad * 2) / H);
-  const ox = (w - W * s) / 2, oy = (h - H * s) / 2;
-  const M = timeline.scenes.length;
-  if (plan && plan.mode === 'flat') {
-    ctx.fillStyle = '#efe8db';
-    ctx.fillRect(ox, oy, W * s, H * s);
-    ctx.strokeStyle = '#c9bfae';
-    ctx.strokeRect(ox + .5, oy + .5, W * s - 1, H * s - 1);
-    ctx.fillStyle = '#6f6759';
-    ctx.font = '600 13px -apple-system, "Segoe UI", sans-serif';
-    ctx.fillText('整图播放（字幕按段换）', ox + 12, oy + 24);
-    $('mapInfo').innerHTML = `<div>这张图分不出干净的区块：整张图连续画完，字幕按段换。</div>` +
-      timeline.scenes.map((sc, i) => `<div><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#c9bfae;margin-right:6px"></span>第 ${i + 1} 段 · ${((sc.end - sc.start) / 1000).toFixed(1)} 秒<br><span style="color:#8f8677">${sc.paragraphs.map((p) => p.text).join(' / ')}</span></div>`).join('');
+// ── 渲染 ──────────────────────────────────────────────
+function ensureCanvas() {
+  const [w, h] = $('aspect').value.split('x').map(Number);
+  // 尺寸没变就直接返回：重建纸面纹理与字幕排版缓存是每帧最大的浪费
+  if (compositor && painter && state.W === w && state.H === h) return;
+  state.W = w; state.H = h;
+  if (stage.width !== w || stage.height !== h) { stage.width = w; stage.height = h; }
+  stage.parentElement.classList.toggle('portrait', h > w);
+
+  if (!compositor) compositor = new Compositor({ W: w, H: h, canvas: stage });
+  else compositor.resize(w, h);
+
+  const lay = computeLayout(w, h);
+  if (!painter) {
+    painter = new CaptionPainter({
+      W: w, H: h, box: lay.cap,
+      family: state.fontOk ? `"${FONT_NAME}", ${KAI}` : KAI,
+    });
+  } else {
+    painter.W = w; painter.H = h;
+    painter.setBox(lay.cap);
+  }
+}
+
+function rendererFor(sc) {
+  const asset = state.assets.find((a) => a.id === sc.assetId);
+  if (!asset || !asset.strokes) return null;
+  const n = asset.strokes.length;
+  const keep = Math.min(n, Math.max(1, Math.round(sc.keep)));
+  let rec = state.renderers.get(sc.id);
+  if (rec && rec.assetId === asset.id && rec.count === n && rec.keep === keep) return rec;
+
+  let order;
+  if (keep >= n) order = Array.from({ length: n }, (_, i) => i);
+  else {
+    const set = new Set();
+    for (let i = 0; i < keep; i++) set.add(Math.floor((i * n) / keep));
+    order = [...set].sort((a, b) => a - b);
+  }
+  const rd = new StrokeRenderer({ W: asset.w, H: asset.h, strokes: asset.strokes, clips: asset.clips, order });
+  rec = { rd, assetId: asset.id, count: n, keep, orderLen: order.length };
+  state.renderers.set(sc.id, rec);
+  return rec;
+}
+
+function renderAt(ms) {
+  if (!state.timeline || !state.timeline.scenes.length) return;
+  ensureCanvas();
+  const hit = sceneAt(state.timeline, ms);
+  if (!hit) return;
+  const sc = hit.scene;
+  const seg = state.segs.find((s) => s.id === sc.id);
+  const asset = state.assets.find((a) => a.id === sc.assetId);
+  if (!asset) return;
+
+  const rec = rendererFor(sc);
+  let partial = null, tip = null, painted = null;
+  if (rec) {
+    const p = drawProgress(sc, hit.local);
+    const pos = p * rec.orderLen;
+    const nDone = Math.floor(pos);
+    rec.rd.seekTo(nDone, pos - nDone);
+    partial = rec.rd.getPartial();
+    tip = rec.rd.tip;
+    painted = rec.rd.painted;
+  }
+
+  compositor.draw({
+    bitmap: asset.el,
+    imgW: asset.w,
+    imgH: asset.h,
+    painted,
+    partial,
+    tip,
+    tipAlpha: hit.local < sc.drawMs ? 1 : 0,
+  });
+
+  const reveal = clamp((hit.local - 140) / Math.max(360, sc.dur * 0.7), 0, 1);
+  const alpha = clamp((hit.local + 40) / 200, 0, 1);
+  painter.draw(compositor.ctx, {
+    key: sc.id,
+    text: seg ? seg.text : '',
+    reveal,
+    alpha,
+    seed: sc.index * 37,
+  });
+
+  const chips = $('chips').children;
+  for (let i = 0; i < chips.length; i++) chips[i].classList.toggle('on', i === sc.index);
+}
+
+function updateTransport() {
+  const total = state.timeline ? state.timeline.totalMs : 0;
+  $('seek').value = total ? Math.round((state.ms / total) * 1000) : 0;
+  $('time').textContent = `${fmt(state.ms)} / ${fmt(total)}`;
+  $('playBtn').textContent = state.playing ? '❚❚' : '▶';
+}
+
+// ── 播放 ──────────────────────────────────────────────
+async function ensureMix() {
+  if (!state.timeline) return null;
+  const map = new Map(state.segs.map((s) => [s.id, s]));
+  const mix = buildSoundtrack(state.timeline.scenes, (id) => map.get(id));
+  state.mix = mix;
+  return mix;
+}
+
+async function startAudioFrom(fromMs) {
+  const mix = await ensureMix();
+  if (!mix || !mix.hasAudio) { state.srcNode = null; return; }
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!state.audioCtx) state.audioCtx = new AC({ sampleRate: 48000 });
+  if (state.audioCtx.state === 'suspended') await state.audioCtx.resume();
+  try { state.srcNode?.stop(); } catch { /* ignore */ }
+  const ab = toAudioBuffer(state.audioCtx, mix);
+  const src = state.audioCtx.createBufferSource();
+  src.buffer = ab;
+  src.connect(state.audioCtx.destination);
+  src.start(0, clamp(fromMs / 1000, 0, Math.max(0, ab.duration - 0.01)));
+  state.srcNode = src;
+  state.playStart = state.audioCtx.currentTime;
+  state.playFrom = fromMs;
+}
+
+async function play() {
+  if (!state.timeline) return;
+  if (state.ms >= state.timeline.totalMs - 30) state.ms = 0;
+  state.playing = true;
+  await startAudioFrom(state.ms);
+  if (!state.srcNode) {
+    state.playStart = performance.now() / 1000;
+    state.playFrom = state.ms;
+  }
+  updateTransport();
+  requestAnimationFrame(tick);
+}
+
+function pause() {
+  state.playing = false;
+  try { state.srcNode?.stop(); } catch { /* ignore */ }
+  state.srcNode = null;
+  updateTransport();
+}
+
+function tick() {
+  if (!state.playing || !state.timeline) return;
+  const total = state.timeline.totalMs;
+  let ms;
+  if (state.srcNode && state.audioCtx) {
+    ms = state.playFrom + (state.audioCtx.currentTime - state.playStart) * 1000;
+  } else {
+    ms = state.playFrom + (performance.now() / 1000 - state.playStart) * 1000;
+  }
+  if (ms >= total) {
+    state.ms = total;
+    renderAt(total);
+    updateTransport();
+    pause();
     return;
   }
-  timeline.scenes.forEach((sc, i) => {
-    const b = sc.bbox;
-    const x0 = clamp(b[0], 0, W), y0 = clamp(b[1], 0, H);
-    const x1 = clamp(b[2], 0, W), y1 = clamp(b[3], 0, H);
-    ctx.fillStyle = PALETTE[i % PALETTE.length];
-    ctx.globalAlpha = 0.16 + 0.5 * (M <= 1 ? 0 : i / (M - 1));
-    ctx.fillRect(ox + x0 * s, oy + y0 * s, Math.max(2, (x1 - x0) * s), Math.max(2, (y1 - y0) * s));
-    ctx.globalAlpha = 1;
-    ctx.strokeStyle = PALETTE[i % PALETTE.length];
-    ctx.lineWidth = 1;
-    ctx.strokeRect(ox + x0 * s + .5, oy + y0 * s + .5, Math.max(1, (x1 - x0) * s - 1), Math.max(1, (y1 - y0) * s - 1));
-    ctx.fillStyle = '#2c2b28';
-    ctx.font = '600 11px -apple-system, "Segoe UI", sans-serif';
-    ctx.fillText(String(i + 1), ox + x0 * s + 6, oy + y0 * s + 15);
-  });
-
-  const info = timeline.scenes.map((sc, i) => {
-    const texts = sc.paragraphs.map((p) => p.text).join(' / ');
-    return `<div><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:${PALETTE[i % PALETTE.length]};margin-right:6px"></span>第 ${i + 1} 块 · ${sc.strokeCount} 笔 · ${((sc.end - sc.start) / 1000).toFixed(1)} 秒<br><span style="color:#8f8677">${texts || '（无字幕）'}</span></div>`;
-  }).join('');
-  $('mapInfo').innerHTML = info;
+  state.ms = ms;
+  renderAt(ms);
+  updateTransport();
+  requestAnimationFrame(tick);
 }
 
-// ---------------- 导出 ----------------
+// ── 导出 ──────────────────────────────────────────────
 async function doExport() {
-  if (!timeline || exporting) return;
-  stop();
-  exporting = true;
-  abortCtl = new AbortController();
-  $('export').disabled = true;
-  $('go').disabled = true;
-  $('expStage').hidden = false;
-  $('expBar').style.width = '0%';
-  $('expMsg').textContent = '准备录制…';
-  const startMs = currentMs;
+  if (!state.timeline || !state.timeline.totalMs) return;
+  if (state.busy) return;
+  pause();
+
+  if (!pickMime()) { hint('这个浏览器不支持录制视频，请用 Chrome / Edge。', 'warn'); return; }
+
+  state.busy = true;
+  $('expBtn').disabled = true;
+  $('genBtn').disabled = true;
+  $('expBar').hidden = false;
+  $('expFill').style.width = '0%';
+  $('expText').textContent = '准备中…';
+  state.exportSignal = { aborted: false };
+  $('expCancel').addEventListener('click', () => { state.exportSignal.aborted = true; }, { once: true });
+
   try {
-    const blob = await exportVideo({
-      compositor, renderer, captions, timeline,
-      signal: abortCtl.signal,
-      onProgress: (p, sim, total) => {
-        $('expBar').style.width = (p * 100).toFixed(1) + '%';
-        $('expMsg').textContent = `正在录：${(sim / 1000).toFixed(0)} / ${(total / 1000).toFixed(0)} 秒（请保持这个标签页在前台）`;
+    const mix = await ensureMix();
+    const AC = window.AudioContext || window.webkitAudioContext;
+    const tmp = new AC({ sampleRate: 48000 });
+    const ab = toAudioBuffer(tmp, mix);
+    await tmp.close();
+
+    state.ms = 0;
+    renderAt(0);
+    await nextFrame();
+
+    const res = await exportVideo({
+      canvas: stage,
+      audio: ab,
+      totalMs: state.timeline.totalMs,
+      renderAt: (ms) => { state.ms = ms; renderAt(ms); },
+      onProgress: ({ ratio, ms }) => {
+        $('expFill').style.width = Math.round(ratio * 100) + '%';
+        $('expText').textContent = `录制中 ${fmt(ms)} / ${fmt(state.timeline.totalMs)}`;
       },
+      signal: state.exportSignal,
     });
-    const name = `inkbrief-${paragraphsNow.length}段-${stamp()}.webm`;
-    download(blob, name);
-    $('expBar').style.width = '100%';
-    $('expMsg').textContent = `完成，已开始下载：${name}`;
-    showMsg('导出完成。', true);
+
+    const stamp = new Date().toISOString().slice(5, 16).replace(/[-:T]/g, '');
+    downloadBlob(res.blob, `inkbrief-${state.timeline.scenes.length}段-${stamp}.${res.ext}`);
+    if (window.__ink) window.__ink.lastExport = res;
+    const size = (res.blob.size / 1048576).toFixed(1);
+    const drift = (res.audioMs - state.timeline.totalMs) / 1000;
+    hint(`已导出 ${res.ext.toUpperCase()} · ${size}MB · ${state.W}×${state.H} · 时长 ${fmt(state.timeline.totalMs)}（录制用了 ${(res.ms / 1000).toFixed(0)}s，音轨与时间轴差 ${drift.toFixed(2)}s）`);
   } catch (err) {
-    if (String(err.message || err).includes('取消')) {
-      $('expMsg').textContent = '已取消。';
-    } else {
-      console.warn('导出失败：', err);
-      $('expMsg').textContent = '导出失败：' + (err.message || err);
-      showMsg('导出失败：' + (err.message || err));
-    }
+    if (String(err.message).includes('已取消')) hint('导出已取消。');
+    else hint('导出失败：' + (err.message || err), 'warn');
   } finally {
-    exporting = false;
-    abortCtl = null;
-    $('export').disabled = false;
-    $('go').disabled = false;
-    currentMs = clamp(startMs, 0, timeline.totalMs);
-    renderer.reset();
-    renderAt(currentMs);
+    state.busy = false;
+    $('expBar').hidden = true;
+    $('expBtn').disabled = false;
+    $('genBtn').disabled = false;
+    state.exportSignal = null;
+    updateTransport();
   }
 }
 
-function download(blob, name) {
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = name;
-  document.body.appendChild(a);
-  a.click();
-  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
-}
+// ── 事件绑定 ──────────────────────────────────────────
+function bindUI() {
+  $('fileInput').addEventListener('change', (e) => {
+    addFiles(e.target.files);
+    e.target.value = '';
+  });
 
-// ---------------- 字体 ----------------
-async function loadFont() {
-  try {
-    if (!document.fonts) return false;
-    const p = document.fonts.load('46px "MaShanZheng"', '汉字abc');
-    const ok = await Promise.race([
-      p.then((list) => list && list.length > 0),
-      new Promise((r) => setTimeout(() => r(false), 2500)),
-    ]);
-    if (ok && document.fonts.check('46px "MaShanZheng"')) return true;
-  } catch (e) { /* ignore */ }
-  return false;
-}
-
-// ---------------- 绑定 ----------------
-function bind() {
-  $('file').addEventListener('change', (e) => loadFile(e.target.files && e.target.files[0]));
   const drop = $('drop');
-  drop.addEventListener('click', () => $('file').click());
-  drop.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') $('file').click(); });
-  ['dragenter', 'dragover'].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add('over'); }));
-  ['dragleave', 'drop'].forEach((ev) => drop.addEventListener(ev, () => drop.classList.remove('over')));
+  ['dragenter', 'dragover'].forEach((ev) => drop.addEventListener(ev, (e) => {
+    e.preventDefault(); drop.classList.add('over');
+  }));
+  ['dragleave', 'drop'].forEach((ev) => drop.addEventListener(ev, (e) => {
+    e.preventDefault(); drop.classList.remove('over');
+  }));
   drop.addEventListener('drop', (e) => {
-    e.preventDefault();
-    const f = e.dataTransfer.files && e.dataTransfer.files[0];
-    if (f) loadFile(f);
+    if (e.dataTransfer?.files?.length) addFiles(e.dataTransfer.files);
   });
+  window.addEventListener('dragover', (e) => e.preventDefault());
+  window.addEventListener('drop', (e) => e.preventDefault());
 
-  document.querySelectorAll('[data-sample]').forEach((b) => {
-    b.addEventListener('click', () => loadSample(b.getAttribute('data-sample')));
-  });
+  $('splitBtn').addEventListener('click', splitScript);
+  $('genBtn').addEventListener('click', generate);
+  $('expBtn').addEventListener('click', doExport);
 
-  $('text').addEventListener('input', updateCounts);
-  $('go').addEventListener('click', generate);
-  $('play').addEventListener('click', () => { if (playing) stop(); else play(); });
+  $('playBtn').addEventListener('click', () => { if (state.playing) pause(); else play(); });
+
   $('seek').addEventListener('input', (e) => {
-    if (!timeline) return;
-    const ms = (parseInt(e.target.value, 10) / 1000) * timeline.totalMs;
-    currentMs = ms;
-    if (playing) lastT = performance.now();
-    renderAt(ms);
+    if (!state.timeline) return;
+    state.ms = (Number(e.target.value) / 1000) * state.timeline.totalMs;
+    renderAt(state.ms);
+    updateTransport();
   });
-  $('export').addEventListener('click', doExport);
-  $('cancelExp').addEventListener('click', () => { if (abortCtl) abortCtl.abort(); });
 
-  window.addEventListener('keydown', (e) => {
-    if (e.code === 'Space' && !/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)) {
-      e.preventDefault();
-      if (playing) stop(); else play();
-    }
+  $('aspect').addEventListener('change', () => {
+    pause();
+    state.renderers.clear();
+    ensureCanvas();
+    renderAt(state.ms);
+  });
+
+  document.addEventListener('keydown', (e) => {
+    if (e.target.matches('input, textarea, select')) return;
+    if (e.code === 'Space') { e.preventDefault(); if (state.playing) pause(); else play(); }
   });
 }
 
-async function init() {
-  bind();
-  updateCounts();
-  clearPreview();
-  showEmpty('这边会出现一支手绘讲解视频', '左边选图、写文案，点“生成预览”');
-  fontOk = await loadFont();
-  fontFamily = fontOk
-    ? '"MaShanZheng", "KaiTi", "STKaiti", "楷体", serif'
-    : '"KaiTi", "STKaiti", "楷体", serif';
-  if (!fontOk) console.warn('Ma Shan Zheng 未加载，已回退系统楷体');
-  // 字体 5.9MB，慢网可能几秒到几分钟；先在后台继续加载，好了再换回来
-  if (!fontOk && document.fonts && document.fonts.ready) {
-    document.fonts.ready.then(() => {
-      if (!document.fonts.check('46px "MaShanZheng"')) return;
-      fontOk = true;
-      fontFamily = '"MaShanZheng", "KaiTi", "STKaiti", "楷体", serif';
-      if (captions && timeline) {
-        captions.setFamily(fontFamily);
-        captions.prepare(timeline);
-        renderAt(currentMs);
-      }
-      if ($('modeNote').textContent.includes('手写字体没加载成功')) {
-        $('modeNote').textContent = $('modeNote').textContent.replace(' 手写字体没加载成功，已回退系统楷体。', '');
-      }
-    }).catch(() => {});
-  }
-  if (new URLSearchParams(location.search).has('debug')) {
-    window.__ink = {
-      get playing() { return playing; },
-      get ms() { return currentMs; },
-      get total() { return timeline ? timeline.totalMs : 0; },
-    };
-    // 终检：用"场景序"和"原序"各画一遍最终帧，逐像素比较
-    window.__inkVerify = () => {
-      if (!renderer || !strokes) return null;
-      const n = strokes.length;
-      const mk = (order) => {
-        const r = new StrokeRenderer({ W, H, strokes, clips, order });
-        for (let i = 0; i < n; i++) r.paint(i, 1);
-        return r;
-      };
-      const a = mk(timeline.order);
-      const b = mk(Int32Array.from({ length: n }, (_, i) => i));
-      const da = a.pctx.getImageData(0, 0, W, H).data;
-      const db = b.pctx.getImageData(0, 0, W, H).data;
-      let ch = 0, max = 0, px = 0;
-      for (let i = 0; i < da.length; i += 4) {
-        let hit = false;
-        for (let k = 0; k < 3; k++) {
-          const d = Math.abs(da[i + k] - db[i + k]);
-          if (d) { ch++; hit = true; if (d > max) max = d; }
-        }
-        if (hit) px++;
-      }
-      return { strokeCount: n, diffChannels: ch, diffPixels: px, max };
-    };
-  }
+// ── 调试钩子（仅 ?debug=1）────────────────────────────
+if (new URLSearchParams(location.search).has('debug')) {
+  window.__ink = {
+    get state() { return state; },
+    get timeline() { return state.timeline; },
+    renderAt, generate, play, pause,
+    synth: (t) => state.tts.synth(t, voiceOf()),
+    addFiles, splitScript,
+  };
 }
 
-init();
+boot();

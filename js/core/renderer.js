@@ -1,8 +1,6 @@
 // 逐笔渲染器：从 image2strokes 的 app.js 移植（paintStroke / clip 掩膜 / 笔尖）。
 // 只负责把"第 pos 笔、进度 u"画到离屏画布；不负责 UI、时间轴、导出。
 
-import { frameAt } from './timeline.js';
-
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 function hash01(a, b) {
   const x = Math.sin(a * 127.1 + b * 311.7) * 43758.5453;
@@ -61,6 +59,55 @@ function leadPath(t, st) {
   return p;
 }
 
+/** 掩膜图集：一张 2048² 画布按货架排布塞进成百上千个小掩膜，只写一次。 */
+class ClipAtlas {
+  constructor(max = 2048) {
+    this.max = max;
+    this.pages = [];
+    this.slots = new Map();
+    this.pg = null; this.x = 0; this.y = 0; this.rowH = 0;
+  }
+
+  _page() {
+    const cv = document.createElement('canvas');
+    cv.width = this.max; cv.height = this.max;
+    this.pages.push({ cv, ctx: cv.getContext('2d') });
+    this.pg = this.pages[this.pages.length - 1];
+    this.x = 0; this.y = 0; this.rowH = 0;
+    return this.pg;
+  }
+
+  static _paint(ctx, mask, w, h, dx, dy) {
+    const id = ctx.createImageData(w, h);
+    const u32 = new Uint32Array(id.data.buffer);
+    for (let i = 0; i < mask.length; i++) u32[i] = mask[i] ? 0xffffffff : 0;
+    ctx.putImageData(id, dx, dy);
+  }
+
+  get(i, cl) {
+    const hit = this.slots.get(i);
+    if (hit) return hit;
+    // 超过图集尺寸的超大掩膜单独一张，避免浪费整页
+    if (cl.w > this.max || cl.h > this.max) {
+      const cv = document.createElement('canvas');
+      cv.width = cl.w; cv.height = cl.h;
+      ClipAtlas._paint(cv.getContext('2d'), cl.mask, cl.w, cl.h, 0, 0);
+      const s = { cv, x: 0, y: 0, w: cl.w, h: cl.h };
+      this.slots.set(i, s);
+      return s;
+    }
+    if (!this.pg) this._page();
+    if (this.x + cl.w > this.max) { this.x = 0; this.y += this.rowH + 1; this.rowH = 0; }
+    if (this.y + cl.h > this.max) this._page();
+    const s = { cv: this.pg.cv, x: this.x, y: this.y, w: cl.w, h: cl.h };
+    ClipAtlas._paint(this.pg.ctx, cl.mask, cl.w, cl.h, this.x, this.y);
+    this.slots.set(i, s);
+    this.x += cl.w + 1;
+    if (cl.h > this.rowH) this.rowH = cl.h;
+    return s;
+  }
+}
+
 export class StrokeRenderer {
   constructor({ W, H, strokes, clips, order }) {
     this.W = W; this.H = H;
@@ -71,7 +118,7 @@ export class StrokeRenderer {
     this.tmpC = document.createElement('canvas');
     this.tmpC.width = W; this.tmpC.height = H;
     this.tmp = this.tmpC.getContext('2d');
-    this.clipCache = new Map();
+    this.atlas = new ClipAtlas();
     this.done = 0;
     this.partial = null;
     this.lastEnd = [0, 0];
@@ -91,25 +138,71 @@ export class StrokeRenderer {
     if (st0) this.lastEnd = [st0.tp[0], st0.tp[1]];
   }
 
-  clipCanvasFor(c) {
-    if (this.clipCache.has(c)) return this.clipCache.get(c);
-    const cl = this.C[c];
-    const cv = document.createElement('canvas');
-    cv.width = cl.w; cv.height = cl.h;
-    const x = cv.getContext('2d');
-    const id = x.createImageData(cl.w, cl.h);
-    const m = cl.mask;
-    for (let i = 0; i < m.length; i++) {
-      id.data[i * 4] = 255; id.data[i * 4 + 1] = 255; id.data[i * 4 + 2] = 255;
-      id.data[i * 4 + 3] = m[i] ? 255 : 0;
+  clipSlotFor(c) {
+    return this.atlas.get(c, this.C[c]);
+  }
+
+  // 批量画 from..to（同一 clip 的连续笔）：一次清屏、按颜色合并路径、一次掩膜合成。
+  // 单笔合成在 4K 笔规模下会成为瓶颈，这里是整条渲染链最关键的优化。
+  paintRun(from, to) {
+    const S = this.S, order = this.order;
+    const cl = this.C[S[order[from]].c];
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    const groups = new Map();
+    let last = null;
+
+    for (let i = from; i < to; i++) {
+      const st = S[order[i]];
+      last = st;
+      const pad = Math.max(4, st.w * 0.9);
+      const rib = st.rib;
+      for (let k = 0; k < rib.length; k += 2) {
+        const px = rib[k], py = rib[k + 1];
+        if (px - pad < x0) x0 = px - pad;
+        if (px + pad > x1) x1 = px + pad;
+        if (py - pad < y0) y0 = py - pad;
+        if (py + pad > y1) y1 = py + pad;
+      }
+      const key = (st.color[0] << 16) | (st.color[1] << 8) | st.color[2];
+      let p = groups.get(key);
+      if (!p) { p = new Path2D(); groups.set(key, p); }
+      p.moveTo(rib[0], rib[1]);
+      for (let k = 2; k < rib.length; k += 2) p.lineTo(rib[k], rib[k + 1]);
+      p.closePath();
     }
-    x.putImageData(id, 0, 0);
-    if (this.clipCache.size > 40) {
-      const first = this.clipCache.keys().next().value;
-      this.clipCache.delete(first);
+    if (!last) return;
+
+    const rx = Math.max(cl.x, Math.floor(x0));
+    const ry = Math.max(cl.y, Math.floor(y0));
+    const rw = Math.max(1, Math.min(cl.x + cl.w, Math.ceil(x1)) - rx);
+    const rh = Math.max(1, Math.min(cl.y + cl.h, Math.ceil(y1)) - ry);
+
+    const tmp = this.tmp;
+    tmp.setTransform(1, 0, 0, 1, 0, 0);
+    tmp.clearRect(rx, ry, rw, rh);
+    tmp.save();
+    tmp.lineWidth = 1.4;
+    tmp.lineJoin = 'round';
+    tmp.lineCap = 'round';
+    for (const [key, p] of groups) {
+      const rgb = 'rgb(' + ((key >> 16) & 255) + ',' + ((key >> 8) & 255) + ',' + (key & 255) + ')';
+      tmp.fillStyle = rgb;
+      tmp.strokeStyle = rgb;
+      tmp.fill(p);
+      tmp.stroke(p);
     }
-    this.clipCache.set(c, cv);
-    return cv;
+    tmp.restore();
+    tmp.globalCompositeOperation = 'destination-in';
+    const slot = this.clipSlotFor(last.c);
+    tmp.drawImage(slot.cv, slot.x + (rx - cl.x), slot.y + (ry - cl.y), rw, rh, rx, ry, rw, rh);
+    tmp.globalCompositeOperation = 'source-over';
+    this.pctx.drawImage(this.tmpC, rx, ry, rw, rh, rx, ry, rw, rh);
+
+    this.lastEnd = [last.tp[0], last.tp[1]];
+    this.tip = {
+      x: last.tp[0], y: last.tp[1],
+      r: Math.max(2.5, last.w * 0.5), pen: last.pen, color: last.color,
+    };
   }
 
   // pos = 播放序；u=1 整笔（落到成品），u<1 半成品（只进 tmpC）
@@ -119,7 +212,25 @@ export class StrokeRenderer {
     const t = tipAt(st, u);
     this.tip = { x: t.x, y: t.y, r: Math.max(2.5, st.w * 0.5), pen: st.pen, color: st.color };
     const rgb = 'rgb(' + st.color[0] + ',' + st.color[1] + ',' + st.color[2] + ')';
-    const rect = { x: cl.x, y: cl.y, w: cl.w, h: cl.h };
+
+    // 只处理这一笔自己的包围盒（与 clip 求交），避免每笔清空整块掩膜区域
+    const pad = Math.max(6, st.w * 1.8);
+    const rib = st.rib;
+    let bx0 = Infinity, by0 = Infinity, bx1 = -Infinity, by1 = -Infinity;
+    for (let i = 0; i < rib.length; i += 2) {
+      const px = rib[i], py = rib[i + 1];
+      if (px < bx0) bx0 = px;
+      if (px > bx1) bx1 = px;
+      if (py < by0) by0 = py;
+      if (py > by1) by1 = py;
+    }
+    bx0 -= pad; by0 -= pad; bx1 += pad; by1 += pad;
+    const x0 = Math.max(cl.x, Math.floor(bx0));
+    const y0 = Math.max(cl.y, Math.floor(by0));
+    const x1 = Math.min(cl.x + cl.w, Math.ceil(bx1));
+    const y1 = Math.min(cl.y + cl.h, Math.ceil(by1));
+    const rect = { x: x0, y: y0, w: Math.max(1, x1 - x0), h: Math.max(1, y1 - y0) };
+
     const tmp = this.tmp;
     tmp.setTransform(1, 0, 0, 1, 0, 0);
     tmp.clearRect(rect.x, rect.y, rect.w, rect.h);
@@ -154,7 +265,13 @@ export class StrokeRenderer {
     }
     tmp.restore();
     tmp.globalCompositeOperation = 'destination-in';
-    tmp.drawImage(this.clipCanvasFor(st.c), rect.x, rect.y);
+    // 图集槽位的原点对应 (cl.x, cl.y)，只贴 rect 那一片
+    const slot = this.clipSlotFor(st.c);
+    tmp.drawImage(
+      slot.cv,
+      slot.x + (rect.x - cl.x), slot.y + (rect.y - cl.y), rect.w, rect.h,
+      rect.x, rect.y, rect.w, rect.h,
+    );
     tmp.globalCompositeOperation = 'source-over';
     const ctx = this.pctx;
     ctx.drawImage(this.tmpC, rect.x, rect.y, rect.w, rect.h, rect.x, rect.y, rect.w, rect.h);
@@ -167,26 +284,34 @@ export class StrokeRenderer {
     return { complete: false, rect, tip: this.tip };
   }
 
-  // 把画布推进到时间线 t（毫秒）。向后会重置重画。
-  seek(timeline, t) {
-    const fr = frameAt(timeline, t);
-    if (fr.done < this.done) this.reset();
-    while (this.done < fr.done) {
-      this.paint(this.done, 1);
-      this.done++;
+  // 把画布推进到「已画完 done 笔 + 当前笔进度 u」。向后会重置重画。
+  seekTo(done, u = 0) {
+    const total = this.order.length;
+    const target = Math.max(0, Math.min(done, total));
+    if (target < this.done) this.reset();
+    while (this.done < target) {
+      const c = this.S[this.order[this.done]].c;
+      let end = this.done + 1;
+      while (end < target && this.S[this.order[end]].c === c) end++;
+      this.paintRun(this.done, end);
+      this.done = end;
     }
-    if (fr.cur >= 0) {
-      const u = fr.u;
-      if (u > 0.001) this.paint(fr.cur, u);
-      else {
-        this.partial = null;
-        const st = this.S[this.order[fr.cur]];
-        if (st) this.tip = { x: st.tp[0], y: st.tp[1], r: Math.max(2.5, st.w * 0.5), pen: st.pen, color: st.color };
-      }
+    if (u > 0.002 && target < total) {
+      this.paint(target, Math.min(u, 1));
     } else {
       this.partial = null;
+      if (target < total) {
+        const st = this.S[this.order[target]];
+        if (st) this.tip = { x: st.tp[0], y: st.tp[1], r: Math.max(2.5, st.w * 0.5), pen: st.pen, color: st.color };
+      }
     }
-    return fr;
+    return this.done;
+  }
+
+  // 已画完的总像素进度（0..1），用于抽稀后的稳定推进
+  progress() {
+    const total = this.order.length || 1;
+    return Math.min(1, this.done / total);
   }
 
   // 跳到某个场景起点：从头重画到该时刻

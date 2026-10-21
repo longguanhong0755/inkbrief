@@ -1,16 +1,19 @@
 {
   "name": "inkbrief",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "图片 + 分段文案 → 手绘讲解视频（纯前端，导出 WebM）",
+  "description": "多图 + 多段文案 → 带本地配音和手写字幕的手绘讲解视频（纯前端，导出 MP4）",
   "license": "MIT",
   "scripts": {
     "start": "python -m http.server 8000",
-    "test": "node dev/regress.mjs",
-    "test:order": "node dev/order_check.mjs",
-    "test:timeline": "node dev/timeline_check.mjs",
-    "test:subtitle": "node dev/subtitle_layout.mjs",
-    "test:scene": "node dev/scene_map.mjs"
+    "test": "node dev/wsola_test.mjs",
+    "test:e2e": "node dev/e2e.mjs",
+    "test:edge": "node dev/e2e_edge.mjs",
+    "test:smoke": "node dev/smoke.mjs",
+    "test:perf": "node dev/perf.mjs",
+    "tts:chars": "node dev/gen_zh_dict.mjs",
+    "tts:phonemes": "node dev/build_zh_phonemes.mjs",
+    "tts:table": "node dev/build_phoneme_ids.mjs"
   }
 }

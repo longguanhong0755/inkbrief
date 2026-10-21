@@ -3,136 +3,102 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>inkbrief · 图片 + 文案 → 手绘讲解视频</title>
-<meta name="description" content="一张图加几段文案，在浏览器里画成一支带手写字幕的讲解视频。纯前端，图片不上传，导出 WebM。">
+<title>inkbrief · 图片 + 文案 → 手绘讲解视频（带配音与字幕）</title>
+<meta name="description" content="多张图配多段文案，浏览器里逐屏手绘、本地 TTS 配音、字幕同步，导出 MP4。图片文字音频都不上传。">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23c4553b'/%3E%3Cpath d='M8 22 L20 10 L24 14 L12 26 Z' fill='%23fff'/%3E%3C/svg%3E">
-<link rel="stylesheet" href="css/app.css?v=4">
+<link rel="stylesheet" href="css/app.css?v=5">
+<script defer src="js/vendor/pinyin-pro.min.js?v=5"></script>
+<script defer src="js/vendor/ort/ort.wasm.min.js?v=5"></script>
+<script type="module" src="js/main.js?v=5"></script>
 </head>
 <body>
+
+<!-- 首屏加载：语音引擎 -->
+<div id="boot" class="boot">
+  <div class="boot-card">
+    <div class="boot-logo">inkbrief</div>
+    <p class="boot-sub">图片和文字都不出浏览器。首次使用需要下载一次本地语音引擎。</p>
+    <div class="bar"><i id="bootBar"></i></div>
+    <p class="boot-note" id="bootText">准备中…</p>
+    <button id="bootSkip" class="link">先跳过语音，直接用</button>
+  </div>
+</div>
+
 <header class="top">
   <div class="brand">
     <span class="mark">inkbrief</span>
-    <span class="tag">图片 + 文案 → 手绘讲解视频</span>
+    <span class="tag">多图 · 分段配音 · 手绘讲解</span>
   </div>
-  <div class="top-links">
-    <a href="https://github.com/longguanhong0755/inkbrief" target="_blank" rel="noreferrer">GitHub</a>
-    <span>MIT</span>
+  <div class="top-actions">
+    <label class="sel">
+      画幅
+      <select id="aspect">
+        <option value="1920x1080">横屏 1080p</option>
+        <option value="1080x1920">竖屏 1080p</option>
+      </select>
+    </label>
+    <label class="sel">
+      音色
+      <select id="voice"></select>
+    </label>
+    <button id="genBtn" class="primary" disabled>生成</button>
+    <button id="expBtn" disabled>导出视频</button>
   </div>
 </header>
 
-<main class="wrap">
-  <aside class="panel">
-    <section class="card">
-      <h2><span class="num">1</span>选一张图</h2>
-      <div id="drop" class="drop" tabindex="0" role="button" aria-label="选择图片">
-        <input id="file" type="file" accept="image/*" hidden>
-        <div id="dropHint" class="drop-hint">
-          点这里选图，或把图片拖进来
-          <small>图片只在浏览器里处理，不上传</small>
-        </div>
-        <img id="thumb" alt="" hidden>
-      </div>
-      <div class="samples">
-        <button class="chip" data-sample="cat">示例：小猫</button>
-        <button class="chip" data-sample="poster">示例：航空邮件</button>
-        <button class="chip" data-sample="photo">示例：照片</button>
-      </div>
-    </section>
+<main class="grid">
 
-    <section class="card">
-      <h2><span class="num">2</span>写几段文案</h2>
-      <textarea id="text" spellcheck="false" placeholder="用空行分段，一段对应画面的一块区域。
+  <section class="pane pane-assets">
+    <h2><b>1</b> 图片</h2>
+    <label class="drop" id="drop">
+      <input type="file" id="fileInput" accept="image/*" multiple hidden>
+      <span id="dropText">拖入图片，或点这里选择<br><small>可一次多选，顺序即出场顺序</small></span>
+    </label>
+    <div class="thumbs" id="thumbs"></div>
+    <p class="hint" id="assetHint"></p>
+  </section>
 
-例如：
-一只圆脸小猫
-
-粉色的耳朵和腮红
-
-它正眯着眼睛笑"></textarea>
-      <div class="hint"><span id="segInfo">0 段</span><span id="charInfo">0 字</span></div>
-    </section>
-
-    <section class="card">
-      <h2><span class="num">3</span>生成</h2>
-      <details class="adv">
-        <summary>高级设置</summary>
-        <label>画法
-          <select id="style">
-            <option value="marker" selected>马克笔</option>
-            <option value="pencil">铅笔</option>
-            <option value="oil">油画</option>
-          </select>
-        </label>
-        <label>细节
-          <select id="detail">
-            <option value="0">快（少补笔）</option>
-            <option value="1" selected>标准</option>
-            <option value="2">细（多补笔）</option>
-          </select>
-        </label>
-        <label>颜色
-          <select id="colors">
-            <option value="0" selected>自动</option>
-            <option value="24">24 色</option>
-            <option value="32">32 色</option>
-            <option value="40">40 色</option>
-          </select>
-        </label>
-      </details>
-      <button id="go" class="primary" disabled>生成预览</button>
-      <div id="genStage" class="stage" hidden>
-        <div class="bar"><i id="genBar"></i></div>
-        <div id="genMsg" class="muted">准备…</div>
-      </div>
-      <div id="msg" class="msg" hidden></div>
-    </section>
-
-    <p class="side-note">纯前端：图片不上传，视频在本机录出来。第一版不做配音。</p>
-  </aside>
-
-  <section class="preview">
-    <div class="canvas-card">
-      <canvas id="cv" width="1280" height="720"></canvas>
-      <div id="empty" class="empty">
-        <div class="empty-title">这边会出现一支手绘讲解视频</div>
-        <div class="empty-sub">左边选图、写文案，点“生成预览”</div>
-      </div>
-      <div class="controls">
-        <button id="play" class="ghost" disabled>播放</button>
-        <span id="clock" class="clock">0:00 / 0:00</span>
-        <input id="seek" type="range" min="0" max="1000" value="0" disabled aria-label="回放进度">
-        <button id="export" class="primary small" disabled>导出 WebM</button>
-      </div>
-      <div id="scenes" class="scenes"></div>
+  <section class="pane pane-script">
+    <h2><b>2</b> 文案与配音</h2>
+    <div class="raw">
+      <textarea id="rawScript" rows="4" placeholder="把整篇稿子粘进来，每段之间空一行。&#10;&#10;例如：&#10;今天聊三件事。&#10;&#10;第一，图片不要上传。"></textarea>
+      <button id="splitBtn" class="ghost">按空行分段</button>
     </div>
-
-    <div class="meta-row">
-      <div id="stats" class="stats">还没有生成。</div>
-      <div id="modeNote" class="note"></div>
-    </div>
-
-    <div class="mapping">
-      <div class="mapping-head">画面分区 <span>（颜色越深越晚画）</span></div>
-      <div class="mapping-body">
-        <canvas id="map" width="320" height="180"></canvas>
-        <div id="mapInfo" class="muted">生成后显示“第几段对应哪一块”。</div>
-      </div>
-    </div>
-
-    <div id="expStage" class="stage" hidden>
-      <div class="bar"><i id="expBar"></i></div>
-      <div id="expMsg" class="muted"></div>
-      <button id="cancelExp" class="ghost small">取消</button>
+    <div class="segs" id="segs">
+      <p class="empty">还没有分段。粘稿子后点「按空行分段」。</p>
     </div>
   </section>
+
+  <section class="pane pane-preview">
+    <h2><b>3</b> 预览 <small id="stat"></small></h2>
+    <div class="stage-wrap">
+      <canvas id="stage" width="1920" height="1080"></canvas>
+      <div class="stage-empty" id="stageEmpty">还没有可预览的内容</div>
+    </div>
+    <div class="transport">
+      <button id="playBtn" class="round" disabled aria-label="播放">▶</button>
+      <input type="range" id="seek" min="0" max="1000" value="0" step="1" disabled>
+      <span id="time" class="time">0.0 / 0.0s</span>
+    </div>
+    <div class="chips" id="chips"></div>
+    <div class="exp-bar" id="expBar" hidden>
+      <div class="bar"><i id="expFill"></i></div>
+      <span id="expText">导出中…</span>
+      <button id="expCancel" class="link">取消</button>
+    </div>
+    <p class="hint" id="previewHint"></p>
+  </section>
+
 </main>
 
-<footer class="foot">
-  <span>绘制引擎来自 <a href="https://github.com/longguanhong0755/image2strokes" target="_blank" rel="noreferrer">image2strokes</a>（MIT）</span>
-  <span>手写字体 Ma Shan Zheng（SIL OFL 1.1）</span>
-  <span>本项目 MIT</span>
-</footer>
-
-<script type="module" src="js/main.js?v=4"></script>
+<script>
+// 极简兜底提示：模块脚本加载失败时不要留一个空白页
+window.addEventListener('error', function (e) {
+  var b = document.getElementById('bootText');
+  if (b && document.getElementById('boot').style.display !== 'none') {
+    b.textContent = '加载出错：' + (e.message || '未知错误');
+  }
+}, true);
+</script>
 </body>
 </html>
