@@ -5,7 +5,7 @@ import { CaptionPainter } from './core/subtitle.js';
 import {
   buildTimeline, sceneAt, drawProgress, estimateDurationMs,
 } from './core/timeline.js';
-import { TTSEngine, VOICES } from './tts/engine.js';
+import { TTSEngine, VOICES } from './tts/engine.js?v=6';
 import { buildSoundtrack, toAudioBuffer } from './audio/mix.js';
 import { exportVideo, downloadBlob, pickMime } from './core/exporter.js';
 
