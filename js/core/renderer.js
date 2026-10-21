@@ -1,5 +1,6 @@
 // 逐笔渲染器：从 image2strokes 的 app.js 移植（paintStroke / clip 掩膜 / 笔尖）。
 // 只负责把"第 pos 笔、进度 u"画到离屏画布；不负责 UI、时间轴、导出。
+import { buildOrder } from './stroke-order.js?v=8';
 
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 function hash01(a, b) {
@@ -124,6 +125,15 @@ export class StrokeRenderer {
     this.lastEnd = [0, 0];
     this.tip = null;
     this.reset();
+  }
+
+  /**
+   * 造一个渲染器。keep < 笔数时按「整块优先」的策略抽稀，
+   * 避免丢笔造成画面永久白斑（详见 core/stroke-order.js）。
+   */
+  static create({ W, H, strokes, clips, keep }) {
+    const order = buildOrder(strokes, clips, keep);
+    return new StrokeRenderer({ W, H, strokes, clips, order });
   }
 
   reset() {

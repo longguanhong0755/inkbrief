@@ -15,6 +15,19 @@ const LETTERS = {
 // 轻声（5）常缺条目，按顺序回退
 const TONE_FALLBACK = [4, 1, 2, 3];
 
+// 半角标点 → 音素表里的全角键。
+// 音素表的 punct 键全是全角（，。！？；：、—…（）），
+// 查表前先做这一步映射，半角输入才不会查不到。
+const PUNCT_FALLBACK = {
+  ',': '，', '.': '。', '!': '！', '?': '？', ';': '；', ':': '：',
+  '(': '（', ')': '）', '—': '—', '…': '…',
+};
+
+// 标点与空白（切块用）：全角半角都要覆盖
+const PUNCT_CLASS = '，。！？；：、（）—…,.!?;:"\'()';
+const SPLIT_RE = /([，。！？；：、（）—…,.!?;:"'()\s]+)/;
+const IS_PUNCT_RE = /^[，。！？；：、（）—…,.!?;:"'()\s]+$/;
+
 const isHan = (c) => c >= '\u4e00' && c <= '\u9fa5';
 
 export function createSequencer(table, pinyinFn) {
@@ -64,23 +77,27 @@ export function createSequencer(table, pinyinFn) {
     const ids = [table.bos];
     if (!text || !text.trim()) { ids.push(table.eos); return ids; }
 
-    // 全角转半角
+    // 归一化：
+    // - 全角字母数字转半角（拼音库只认半角）
+    // - 全角标点**保持全角**：音素表的 punct 键就是全角，转半角就查不到了
+    // - 省略号保留（表里有「…」的键），破折号统一成「—」
     const norm = text
-      .replace(/[\uFF01-\uFF5E]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0))
+      .replace(/[\uFF10-\uFF19\uFF21-\uFF3A\uFF41-\uFF5A]/g, (c) =>
+        String.fromCharCode(c.charCodeAt(0) - 0xfee0))
       .replace(/\u3000/g, ' ')
       .replace(/[“”‘’]/g, '')
-      .replace(/[—–‑]/g, '-')
-      .replace(/…/g, '.');
+      .replace(/[–—]/g, '—');
 
     // 按标点与空白切块，保留标点
-    const chunks = norm.split(/([，。！？；：、,.!?;:\s]+)/).filter((s) => s.length);
+    const chunks = norm.split(SPLIT_RE).filter((s) => s.length);
 
     for (const chunk of chunks) {
       if (!chunk.trim()) { continue; }
       // 标点
-      if (/^[，。！？；：、,.!?;:\s]+$/.test(chunk)) {
+      if (IS_PUNCT_RE.test(chunk)) {
         for (const ch of chunk) {
-          if (table.punct[ch] !== undefined) ids.push(table.punct[ch]);
+          const key = table.punct[ch] !== undefined ? ch : PUNCT_FALLBACK[ch];
+          if (key !== undefined && table.punct[key] !== undefined) ids.push(table.punct[key]);
         }
         continue;
       }

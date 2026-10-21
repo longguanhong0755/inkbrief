@@ -16,7 +16,9 @@ const errors = [];
 page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text().slice(0, 200)); });
 page.on('pageerror', (e) => errors.push('pageerror: ' + String(e).slice(0, 200)));
 
-await page.goto('http://127.0.0.1:8742/index.html?debug=1', { waitUntil: 'domcontentloaded' });
+const BASE = process.env.URL || 'http://127.0.0.1:8742';
+
+await page.goto(BASE + '/index.html?debug=1', { waitUntil: 'domcontentloaded' });
 await page.waitForFunction(() => document.getElementById('boot')?.hidden === true, null, { timeout: 180000 });
 
 console.log('── 空状态 ──');

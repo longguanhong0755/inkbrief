@@ -6,10 +6,10 @@
 <title>inkbrief · 图片 + 文案 → 手绘讲解视频（带配音与字幕）</title>
 <meta name="description" content="多张图配多段文案，浏览器里逐屏手绘、本地 TTS 配音、字幕同步，导出 MP4。图片文字音频都不上传。">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23c4553b'/%3E%3Cpath d='M8 22 L20 10 L24 14 L12 26 Z' fill='%23fff'/%3E%3C/svg%3E">
-<link rel="stylesheet" href="css/app.css?v=7">
-<script defer src="js/vendor/pinyin-pro.min.js?v=7"></script>
-<script defer src="js/vendor/ort/ort.wasm.min.js?v=7"></script>
-<script type="module" src="js/main.js?v=7"></script>
+<link rel="stylesheet" href="css/app.css?v=8">
+<script defer src="js/vendor/pinyin-pro.min.js?v=8"></script>
+<script defer src="js/vendor/ort/ort.wasm.min.js?v=8"></script>
+<script type="module" src="js/main.js?v=8"></script>
 </head>
 <body>
 
@@ -67,6 +67,7 @@
     <div class="segs" id="segs">
       <p class="empty">还没有分段。粘稿子后点「按空行分段」。</p>
     </div>
+    <p class="hint warn-hint" id="unboundHint" hidden></p>
   </section>
 
   <section class="pane pane-preview">

@@ -13,10 +13,10 @@ function hann(n) {
 /**
  * @param {Float32Array} input 单声道 PCM，取值 -1..1
  * @param {number} rate 时长倍率：输出时长 ≈ 输入时长 / rate
- * @param {number} sr 采样率
+ * @param {number} sr 采样率（默认与 TTS 模型一致：16000）
  * @returns {Float32Array}
  */
-export function timeStretch(input, rate, sr = 22050) {
+export function timeStretch(input, rate, sr = 16000) {
   const len = input.length;
   if (!len) return new Float32Array(0);
   if (!isFinite(rate) || rate <= 0) rate = 1;
@@ -81,7 +81,7 @@ export function timeStretch(input, rate, sr = 22050) {
   return out;
 }
 
-/** 线性重采样到目标采样率（用于把 22050 的 TTS 输出送到 48000 的混音图） */
+/** 线性重采样到目标采样率（用于把 16000 的 TTS 输出送到 48000 的混音图） */
 export function resample(input, from, to) {
   if (from === to) return input.slice();
   const ratio = to / from;

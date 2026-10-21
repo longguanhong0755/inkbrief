@@ -3,7 +3,9 @@
 import { createSequencer } from './phonemize.js';
 
 const DEFAULTS = {
-  sampleRate: 22050,
+  // 必须与模型 config 里的 audio.sample_rate 一致（assets/tts/zh-huayan.json = 16000）。
+  // 写成 22050 会让配音快 1.38 倍、音高高 5.5 个半音，听着像花栗鼠。
+  sampleRate: 16000,
   model: 'assets/tts/zh-huayan-fp16.onnx',
   // 模型解压后的真实字节数。GitHub Pages 等 CDN 会对 .onnx 做 gzip，
   // 此时 content-length 是压缩后大小（约 9.0MB），而 reader 读到的是解压后的

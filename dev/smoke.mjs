@@ -3,7 +3,10 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.PLAYWRIGHT_CORE || 'playwright-core');
 
-const URL = process.env.URL || 'http://127.0.0.1:8742/index.html?debug=1';
+// 约定：URL 只给 base（不含 /index.html），脚本自己拼路径。
+// 和 dev/e2e.mjs、dev/e2e_edge.mjs 保持一致，避免「传了 base 却少了 ?debug=1」这类坑。
+const BASE = process.env.URL || 'http://127.0.0.1:8742';
+const PAGE = BASE + '/index.html?debug=1';
 
 const browser = await chromium.launch({
   executablePath: 'C:/Program Files/Google/Chrome/Application/chrome.exe',
@@ -32,7 +35,7 @@ page.on('requestfailed', (r) => {
 });
 
 const t0 = Date.now();
-await page.goto(URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+await page.goto(PAGE, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
 // 等 boot 消失（语音引擎就绪）
 let booted = false;
@@ -48,6 +51,10 @@ if (!booted) console.log('boot 未完成，停在：', bootText);
 
 // 字体在引擎就绪之后才开始下载，给它一点时间再判断
 await page.waitForFunction(() => window.__ink?.state?.fontOk === true, null, { timeout: 60000 }).catch(() => {});
+
+// boot 遮罩在 engine.load() resolve 之后才隐藏，但 state.ttsReady 是紧跟着才置位的，
+// 两者之间有一帧的窗口。显式等一次，避免把「读早了」误判成「引擎没就绪」。
+await page.waitForFunction(() => window.__ink?.state?.ttsReady === true, null, { timeout: 60000 }).catch(() => {});
 
 const info = await page.evaluate(() => {
   const s = window.__ink?.state;

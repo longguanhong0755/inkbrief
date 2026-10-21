@@ -56,7 +56,9 @@ for (let i = 0; i < 3; i++) {
 }
 const audioInfo = await page.evaluate(() => window.__ink.state.segs.map((s) => ({ d: +(s.audio.duration).toFixed(2), sr: s.audio.sr })));
 ok('三段都有配音', audioInfo.every((a) => a.d > 0.3), JSON.stringify(audioInfo));
-ok('采样率 22050', audioInfo.every((a) => a.sr === 22050));
+// 采样率必须等于模型 config 的 16000。之前这里断言 22050，是把 bug 写进了测试：
+// 引擎硬编码 22050 但模型输出 16000，配音快 1.38 倍、音高高 5.5 个半音。
+ok('采样率 16000（与模型一致）', audioInfo.every((a) => a.sr === 16000));
 
 T('生成笔触');
 const tGen = Date.now();
@@ -116,7 +118,11 @@ const f1 = await frameStats(tl.total * 0.5);
 const f2 = await frameStats(tl.total - 60);
 ok('开头画面几乎空白', f0.ink < 0.06, `墨迹占比 ${(f0.ink * 100).toFixed(1)}%`);
 ok('中段画面有内容', f1.ink > 0.10, `墨迹占比 ${(f1.ink * 100).toFixed(1)}%`);
-ok('末尾画面基本画满', f2.ink > f1.ink, `墨迹占比 ${(f2.ink * 100).toFixed(1)}%`);
+// 抽稀改成「主体优先」后，墨迹会提前饱和（先画主体，细节后补），
+// 末尾不再比中段多。所以这里验的是「画面已经画满且没有倒退」，
+// 而不是「末尾比中段墨迹更多」——那是等距抽稀时代的假设。
+ok('末尾画面已经画满', f2.ink > 0.30, `墨迹占比 ${(f2.ink * 100).toFixed(1)}%`);
+ok('末尾画面不倒退', f2.ink >= f1.ink * 0.97, `${(f1.ink * 100).toFixed(1)}% -> ${(f2.ink * 100).toFixed(1)}%`);
 ok('字幕可见', f2.cap > 40, `深色像素 ${f2.cap}`);
 
 await page.evaluate((t) => { window.__ink.renderAt(t); }, tl.total * 0.6);

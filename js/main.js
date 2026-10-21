@@ -1,11 +1,11 @@
 // inkbrief 主逻辑：多图 + 多段 → 逐屏手绘 + 本地 TTS 配音 + 字幕 → 导出 MP4。
-import { StrokeRenderer } from './core/renderer.js';
+import { StrokeRenderer } from './core/renderer.js?v=8';
 import { Compositor, computeLayout } from './core/compositor.js';
 import { CaptionPainter } from './core/subtitle.js';
 import {
   buildTimeline, sceneAt, drawProgress, estimateDurationMs,
 } from './core/timeline.js';
-import { TTSEngine, VOICES, loadModel } from './tts/engine.js?v=7';
+import { TTSEngine, VOICES, loadModel } from './tts/engine.js?v=8';
 import { buildSoundtrack, toAudioBuffer } from './audio/mix.js';
 import { exportVideo, downloadBlob, pickMime } from './core/exporter.js';
 
@@ -38,6 +38,7 @@ const state = {
   busy: false,
   mix: null,
   fontOk: false,
+  unbound: 0,
 };
 
 let worker = null;
@@ -390,6 +391,20 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 }
 
+/** 未配图的段：段落卡上有红框，这里再给一条汇总，导出前必须看得见 */
+function updateUnboundHint(unbound) {
+  const el = $('unboundHint');
+  if (!el) return;
+  if (!unbound.length) { el.hidden = true; el.textContent = ''; return; }
+  const noAsset = unbound.filter((s) => !s.assetId).length;
+  const badAsset = unbound.length - noAsset;
+  const parts = [];
+  if (noAsset) parts.push(`${noAsset} 段没配图`);
+  if (badAsset) parts.push(`${badAsset} 段配的图已被删除`);
+  el.hidden = false;
+  el.textContent = `⚠ ${parts.join('，')}，不会出现在成片里。点段落卡上的「选择配图」补上。`;
+}
+
 function cycleAsset(seg) {
   if (!state.assets.length) { hint('先加图片。', 'warn'); return; }
   const idx = state.assets.findIndex((a) => a.id === seg.assetId);
@@ -469,8 +484,13 @@ async function generate() {
 }
 
 function rebuild() {
-  const segs = state.segs.filter((s) => s.assetId && state.assets.some((a) => a.id === s.assetId));
-  if (!segs.length) {
+  const bound = state.segs.filter((s) => s.assetId && state.assets.some((a) => a.id === s.assetId));
+  // 没配图的段不能静默吞掉：用户以为有 8 段，实际只出 6 屏，他不知道少了什么
+  const unbound = state.segs.filter((s) => !(s.assetId && state.assets.some((a) => a.id === s.assetId)));
+  state.unbound = unbound.length;
+  updateUnboundHint(unbound);
+
+  if (!bound.length) {
     state.timeline = null;
     $('chips').innerHTML = '';
     $('stageEmpty').hidden = false;
@@ -481,7 +501,7 @@ function rebuild() {
     return;
   }
 
-  const mapped = segs.map((s) => {
+  const mapped = bound.map((s) => {
     const a = state.assets.find((x) => x.id === s.assetId);
     return {
       id: s.id, text: s.text, hasImage: !!a,
@@ -564,15 +584,11 @@ function rendererFor(sc) {
   let rec = state.renderers.get(sc.id);
   if (rec && rec.assetId === asset.id && rec.count === n && rec.keep === keep) return rec;
 
-  let order;
-  if (keep >= n) order = Array.from({ length: n }, (_, i) => i);
-  else {
-    const set = new Set();
-    for (let i = 0; i < keep; i++) set.add(Math.floor((i * n) / keep));
-    order = [...set].sort((a, b) => a - b);
-  }
-  const rd = new StrokeRenderer({ W: asset.w, H: asset.h, strokes: asset.strokes, clips: asset.clips, order });
-  rec = { rd, assetId: asset.id, count: n, keep, orderLen: order.length };
+  // 抽稀策略见 core/stroke-order.js：整块优先，不丢笔造成白斑
+  const rd = StrokeRenderer.create({
+    W: asset.w, H: asset.h, strokes: asset.strokes, clips: asset.clips, keep,
+  });
+  rec = { rd, assetId: asset.id, count: n, keep, orderLen: rd.order.length };
   state.renderers.set(sc.id, rec);
   return rec;
 }
