@@ -24,12 +24,17 @@ await page.goto(URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
 // 等 boot 消失（语音引擎就绪）
 let booted = false;
 try {
-  await page.waitForFunction(() => document.getElementById('boot')?.hidden === true, null, { timeout: 300000 });
+  // 线上首次访问要走 CDN 拉 21MB（模型 + wasm），国内可能要好几分钟，
+  // 超时按 10 分钟给，避免把「慢」误判成「坏」。
+  await page.waitForFunction(() => document.getElementById('boot')?.hidden === true, null, { timeout: 600000 });
   booted = true;
 } catch { booted = false; }
 const bootMs = Date.now() - t0;
 const bootText = await page.evaluate(() => document.getElementById('bootText')?.textContent);
 if (!booted) console.log('boot 未完成，停在：', bootText);
+
+// 字体在引擎就绪之后才开始下载，给它一点时间再判断
+await page.waitForFunction(() => window.__ink?.state?.fontOk === true, null, { timeout: 60000 }).catch(() => {});
 
 const info = await page.evaluate(() => {
   const s = window.__ink?.state;

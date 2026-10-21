@@ -1,9 +1,6 @@
-@font-face {
-  font-family: "MaShanZheng";
-  src: url("../assets/fonts/MaShanZheng-Regular.woff2") format("woff2"),
-       url("../assets/fonts/MaShanZheng-Regular.ttf") format("truetype");
-  font-display: swap;
-}
+/* 字体由 js/main.js 分片下载后以 FontFace 注册。
+   CSS 里写 @font-face 会让浏览器自己发整包请求，3.1MB 的长连接在国内常被掐断，
+   而且没法重试，所以这里故意不声明。 */
 
 :root {
   --paper: #f4f0e7;

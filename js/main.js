@@ -5,7 +5,7 @@ import { CaptionPainter } from './core/subtitle.js';
 import {
   buildTimeline, sceneAt, drawProgress, estimateDurationMs,
 } from './core/timeline.js';
-import { TTSEngine, VOICES } from './tts/engine.js?v=6';
+import { TTSEngine, VOICES, loadModel } from './tts/engine.js?v=7';
 import { buildSoundtrack, toAudioBuffer } from './audio/mix.js';
 import { exportVideo, downloadBlob, pickMime } from './core/exporter.js';
 
@@ -67,7 +67,6 @@ async function boot() {
   buildVoiceOptions();
   bindUI();
   ensureCanvas();
-  loadFont();
   initWorker();
 
   const engine = new TTSEngine();
@@ -107,19 +106,29 @@ async function boot() {
   }
   renderSegs();
   refreshGenButton();
+  // 引擎就绪后再加载字体，免得 3.2MB 跟 21MB 抢带宽、把首屏拖慢。
+  // 字体后到会触发一次重绘，不阻塞使用。
+  if (!cancelled) loadFont();
 }
 
-function loadFont() {
-  if (!document.fonts) return;
-  document.fonts.load(`40px "${FONT_NAME}"`).then(() => {
-    if (document.fonts.check(`40px "${FONT_NAME}"`)) {
-      state.fontOk = true;
-      if (painter) {
-        painter.setFamily(`"${FONT_NAME}", ${KAI}`);
-        if (state.timeline) renderAt(state.ms);
-      }
+const FONT_URL = 'assets/fonts/MaShanZheng-Regular.woff2';
+const FONT_BYTES = 3247704;
+
+async function loadFont() {
+  if (!document.fonts || typeof FontFace === 'undefined') return;
+  try {
+    // 走和模型同一套分片下载：3.1MB 走单连接在国内同样会被掐断
+    const buf = await loadModel(FONT_URL, FONT_BYTES);
+    const blobUrl = URL.createObjectURL(new Blob([buf], { type: 'font/woff2' }));
+    const face = new FontFace(FONT_NAME, `url(${blobUrl})`);
+    await face.load();
+    document.fonts.add(face);
+    state.fontOk = true;
+    if (painter) {
+      painter.setFamily(`"${FONT_NAME}", ${KAI}`);
+      if (state.timeline) renderAt(state.ms);
     }
-  }).catch(() => {});
+  } catch { /* 拿不到就用系统楷体，只是字味差一点，不影响出片 */ }
 }
 
 function buildVoiceOptions() {

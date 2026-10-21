@@ -115,6 +115,21 @@ python -m http.server 8000
 
 纯静态，没有构建步骤。
 
+## 线上部署（GitHub Pages）
+
+<https://longguanhong0755.github.io/inkbrief/>
+
+推 `main` 分支后 Pages 自动构建，约 1 分钟生效。
+
+**首次打开需要下载 21MB**（语音模型 10.1MB + onnxruntime wasm 11.2MB），之后走浏览器缓存。
+GitHub Pages 的 CDN 在国内实测只有 50～60 KB/s，10MB 的模型要 200 秒左右——这是网络现实，
+不是代码问题，本地 `http.server` 是秒开。如果主要给国内用户访问，把 `assets/tts/`
+和 `js/vendor/ort/` 换成 jsDelivr 之类的国内可达 CDN 会快 4～6 倍。
+
+**改完 js 记得改版本号。** 入口脚本和模块引用都带 `?v=N`（见 `index.html` 与 `js/main.js`），
+Pages 对 `.js` 有 10 分钟缓存，只改内容不改 URL 的话老访客会继续用旧文件。改代码时把
+`?v=6` 一起升上去。
+
 ## 测试
 
 ```bash
@@ -122,6 +137,7 @@ npm test            # WSOLA 变速不变调（时长/音高/边界，25 项）
 npm run test:e2e    # 完整流程 + 导出 MP4（23 项，需要本地服务器 + playwright-core）
 npm run test:edge   # 竖屏、空输入、非图片、超段、390px（16 项）
 npm run test:perf   # 笔数与帧率
+npm run test:smoke  # 打开页面等语音引擎就绪并试合成（可加 URL= 指向线上）
 ```
 
 重建音素表（需要 `@echogarden/espeak-ng-emscripten`，仅开发期）：
