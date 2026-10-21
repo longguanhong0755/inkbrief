@@ -13,6 +13,8 @@ import { makeDraggable, resolveDrop, applyDrop } from './ui/dragdrop.js';
 import { createTimelineView } from './ui/timeline-view.js';
 import { createScenePanel } from './ui/scene-panel.js';
 import { UndoStack } from './ui/undo.js';
+import { TaskQueue } from './core/scheduler.js';
+import { createQueuePanel } from './ui/queue-panel.js';
 
 const $ = (id) => document.getElementById(id);
 const MAX_SEGS = 12;
@@ -58,6 +60,8 @@ let scenePanel = null;
 // 由场景栏的回调置位，rebuild/renderSegs 读它来决定要不要跳过面板重绘。
 let panelEditing = false;
 let undoStack = null;
+let taskQueue = null;
+let queuePanel = null;
 const stage = $('stage');
 
 // ── 小工具 ────────────────────────────────────────────
@@ -85,6 +89,7 @@ async function boot() {
   initScenePanel();
   initUndo();
   bindUndoUI();
+  initQueue();
 
   const engine = new TTSEngine();
   state.tts = engine;
@@ -160,11 +165,40 @@ function buildVoiceOptions() {
   }
   sel.value = state.voiceId;
   sel.addEventListener('change', () => {
+    const old = state.voiceId;
     state.voiceId = sel.value;
-    for (const s of state.segs) if (s.audio) { s.audio = null; s.status = 'idle'; }
+    // 换音色不能把已有配音静默清空——那是用户辛苦生成的东西，
+    // 清掉了没法恢复。改成标黄「音色变了，需重配」，
+    // 用户点了「重配」或「批量配音」才会真的替换。
+    let stale = 0;
+    for (const s of state.segs) {
+      if (!s.audio) continue;
+      s.status = 'stale';
+      s.textChanged = false;   // 是音色变了，不是文案变了
+      s.voiceId = old;         // 记下这段配音是哪个音色配的
+      stale++;
+    }
     renderSegs();
     rebuild();
+    if (stale) {
+      hint(`音色换成「${voiceOf().name}」，${stale} 段旧配音标黄了（不会自动丢弃）。点「批量配音」或某段的「重配」换成新音色。`, 'warn');
+    } else {
+      hint(`音色换成「${voiceOf().name}」。`, 'info');
+    }
+    updateVoiceAllHint();
   });
+}
+
+/** 批量配音按钮旁边的说明：还有几段没配音 */
+function updateVoiceAllHint() {
+  const el = $('voiceAllHint');
+  if (!el) return;
+  const noVoice = state.segs.filter((s) => s.text.trim() && !s.audio).length;
+  const stale = state.segs.filter((s) => s.status === 'stale').length;
+  const parts = [];
+  if (noVoice) parts.push(`${noVoice} 段没配音`);
+  if (stale) parts.push(`${stale} 段音色变了待重配`);
+  el.textContent = parts.join(' · ');
 }
 
 const voiceOf = (id = state.voiceId) => VOICES.find((v) => v.id === id) || VOICES[0];
@@ -614,12 +648,18 @@ function renderSegs() {
     el.dataset.segid = seg.id;
     el.dataset.dropAccept = 'seg';
 
+    // stale 有两种：文案改过、音色换了。都得说清楚是哪一种，
+    // 否则用户不知道为什么这段标黄了。
+    // 注意顺序：stale 要先判，不然有 audio 的段永远走不到 stale 分支。
+    const staleWhy = seg.status === 'stale'
+      ? (seg.textChanged ? '文案改过' : '音色变了')
+      : '';
     const audioPill = seg.status === 'busy'
       ? '<span class="pill">生成中…</span>'
-      : seg.audio
-        ? `<span class="pill ok">配音 ${seg.audio.duration.toFixed(1)}s</span>`
-        : seg.status === 'stale'
-          ? '<span class="pill warn">文案改过，需重配</span>'
+      : seg.status === 'stale'
+        ? `<span class="pill warn">${staleWhy}，需重配</span>`
+        : seg.audio
+          ? `<span class="pill ok">配音 ${seg.audio.duration.toFixed(1)}s</span>`
           : '<span class="pill">无配音</span>';
 
     const dur = segDuration(seg);
@@ -668,6 +708,7 @@ function renderSegs() {
         el.querySelector('.wc').textContent = `${ta.value.replace(/\s/g, '').length} 字`;
         if (seg.audio) {
           seg.status = 'stale';
+          seg.textChanged = true;     // 是文案变了，不是音色变了
           const pill = el.querySelector('.seg-head .right');
           if (pill) pill.innerHTML = '<span class="pill warn">文案改过，需重配</span>';
         }
@@ -892,20 +933,35 @@ function cycleAsset(seg, slotIndex = null) {
 async function genVoice(seg) {
   if (!state.ttsReady) { hint('语音引擎还没就绪。', 'warn'); return; }
   if (!seg.text.trim()) { hint('这段没有文字。', 'warn'); return; }
-  seg.status = 'busy';
-  renderSegs();
-  try {
-    const r = await state.tts.synth(seg.text, voiceOf());
-    if (!r.pcm.length) throw new Error('合成结果为空');
-    seg.audio = { pcm: r.pcm, sr: r.sampleRate, duration: r.pcm.length / r.sampleRate };
-    seg.status = 'done';
-    seg.manualMs = null;
-  } catch (err) {
-    seg.status = 'idle';
-    hint('配音失败：' + (err.message || err), 'warn');
-  }
-  renderSegs();
-  rebuild();
+  // 单段配音也走队列：这样能取消，也能看到它卡在哪
+  if (!taskQueue) initQueue();
+  taskQueue.add({
+    id: 'voice:' + seg.id,
+    label: `配音：${seg.text.slice(0, 12)}${seg.text.length > 12 ? '…' : ''}`,
+    detail: voiceOf().name,
+    group: '配音',
+    run: async (ctx) => {
+      seg.status = 'busy';
+      renderSegs();
+      try {
+        const r = await state.tts.synth(seg.text, voiceOf());
+        if (!r.pcm.length) throw new Error('合成结果为空');
+        if (ctx.signal.aborted) return;
+        seg.audio = { pcm: r.pcm, sr: r.sampleRate, duration: r.pcm.length / r.sampleRate };
+        seg.status = 'done';
+        seg.voiceId = state.voiceId;   // 记下这段配音是哪个音色配的
+        seg.manualMs = null;
+        rebuild();
+        renderSegs();
+        updateVoiceAllHint();
+      } catch (err) {
+        seg.status = 'idle';
+        throw err;         // 让队列标红，用户能看见失败原因
+      }
+    },
+  });
+  taskQueue.start();
+  updateQueueButtons();
 }
 
 // ── 生成 ──────────────────────────────────────────────
@@ -914,6 +970,10 @@ function refreshGenButton() {
   $('genBtn').disabled = !ok;
 }
 
+/**
+ * 生成：一屏一图（或一屏多图）都要分析笔触。
+ * 走队列，每张图一项：能看到跑到第几张、哪张失败、失败的能单独重试。
+ */
 async function generate() {
   if (state.busy) return;
   const segs = state.segs.filter((s) => s.imageIds.length);
@@ -959,6 +1019,141 @@ async function generate() {
     genBtn.disabled = false;
     refreshGenButton();
   }
+}
+
+// ── 任务队列 ──────────────────────────────────────────
+
+/** 初始化队列（一次就够） */
+function initQueue() {
+  const el = $('queuePanel');
+  if (!el) return;
+  taskQueue = new TaskQueue({
+    concurrency: 1,          // 笔触分析很吃 CPU，串行最稳
+    onChange: (items) => {
+      queuePanel?.setItems(items);
+      const el2 = $('queuePanel');
+      if (el2) el2.hidden = !items.length;
+      updateQueueButtons();
+    },
+  });
+  queuePanel = createQueuePanel({
+    root: el,
+    onCancel: (id) => taskQueue.cancel(id),
+    onAbort: (id) => taskQueue.requestAbort(id),
+    onRetry: (id) => taskQueue.retry(id),
+    onCancelAll: () => {
+      const n = taskQueue.abortAll();
+      hint(n ? `已取消 ${n} 个任务。` : '没有排队中的任务。', n ? 'info' : 'warn');
+    },
+    onRetryFailed: () => {
+      const n = taskQueue.retryFailed();
+      hint(n ? `重试 ${n} 个任务。` : '没有失败的任务。', n ? 'info' : 'warn');
+    },
+    onClear: () => taskQueue.clearFinished(),
+  });
+}
+
+/** 队列里还有活儿时，「生成」按钮要变成能取消 */
+function updateQueueButtons() {
+  const genBtn = $('genBtn');
+  if (!genBtn || !taskQueue) return;
+  // 只看笔触任务：配音在跑时「生成」不该变成「停止生成」
+  if (taskQueue.isActiveWhere((x) => x.id.startsWith('stroke:'))) {
+    genBtn.textContent = '停止生成';
+    genBtn.disabled = false;
+  } else {
+    genBtn.textContent = state.timeline ? '重新生成' : '生成';
+    genBtn.disabled = !state.segs.length || !state.segs.some((s) => s.imageIds.length);
+  }
+}
+
+/**
+ * 把每张图要分析的笔触排进队列。
+ * @param {string[]} assetIds
+ */
+function enqueueStrokes(assetIds) {
+  if (!taskQueue) initQueue();
+  const list = [...new Set(assetIds)];
+  let added = 0;
+  for (const id of list) {
+    const a = state.assets.find((x) => x.id === id);
+    if (!a) continue;
+    if (a.strokes) continue;         // 已有笔触，不用重跑
+    taskQueue.add({
+      id: 'stroke:' + a.id,
+      label: `分析笔触：${a.name}`,
+      detail: `${a.w}×${a.h}`,
+      group: '笔触',
+      run: async (ctx) => {
+        const g = a.el.getContext('2d', { willReadFrequently: true });
+        const img = g.getImageData(0, 0, a.w, a.h);
+        const px = new Uint8ClampedArray(img.data.buffer.slice(0));
+        const t0 = performance.now();
+        const res = await runPipeline(px, a.w, a.h, (p) => {
+          if (ctx.signal.aborted) return;
+          ctx.onProgress(p || 0);
+        });
+        if (ctx.signal.aborted) return;
+        a.strokes = res.strokes;
+        a.clips = res.clips;
+        a.pipelineMs = performance.now() - t0;
+        rebuild();
+      },
+    });
+    added++;
+  }
+  if (added) {
+    taskQueue.start();
+    hint(`已加入 ${added} 张图的分析队列。`, 'info');
+  } else {
+    hint('这些图的笔触都已经在本地了，不用重跑。', 'info');
+  }
+  updateQueueButtons();
+}
+
+/**
+ * 批量配音：给所有还没配音的段都配一遍。
+ * @param {boolean} force true = 连已经配好的也重配（换音色后用）
+ */
+function genVoiceAll(force = false) {
+  if (!state.ttsReady) { hint('语音引擎还没就绪。', 'warn'); return; }
+  const targets = state.segs.filter((s) => {
+    if (!s.text.trim()) return false;
+    if (force) return true;
+    // 没配音的，或者标黄待重配的，都要配
+    return !s.audio || s.status === 'stale';
+  });
+  if (!targets.length) {
+    hint(force ? '没有可配音的段。' : '所有段都配好了。要重配就点某一段的「重配」。', 'warn');
+    return;
+  }
+  if (!taskQueue) initQueue();
+  for (const seg of targets) {
+    taskQueue.add({
+      id: 'voice:' + seg.id,
+      label: `配音：${seg.text.slice(0, 12)}${seg.text.length > 12 ? '…' : ''}`,
+      detail: voiceOf().name,
+      group: '配音',
+      run: async (ctx) => {
+        seg.status = 'busy';
+        renderSegs();
+        const r = await state.tts.synth(seg.text, voiceOf());
+        if (!r.pcm.length) throw new Error('合成结果为空');
+        if (ctx.signal.aborted) return;
+        seg.audio = { pcm: r.pcm, sr: r.sampleRate, duration: r.pcm.length / r.sampleRate };
+        seg.status = 'done';
+        seg.voiceId = state.voiceId;   // 记下这段配音是哪个音色配的
+        seg.textChanged = false;
+        seg.manualMs = null;      // 配音说了算
+        rebuild();
+        renderSegs();
+        updateVoiceAllHint();
+      },
+    });
+  }
+  taskQueue.start();
+  hint(`已加入 ${targets.length} 段配音。`, 'info');
+  updateQueueButtons();
 }
 
 function rebuild() {
@@ -1567,7 +1762,19 @@ function bindUI() {
   window.addEventListener('drop', (e) => e.preventDefault());
 
   $('splitBtn').addEventListener('click', () => splitScript($('splitRule')?.value || 'auto'));
-  $('genBtn').addEventListener('click', generate);
+  $('genBtn').addEventListener('click', () => {
+    // 笔触分析在跑就变成「停止」
+    if (taskQueue?.isActiveWhere((x) => x.id.startsWith('stroke:'))) {
+      taskQueue.abortAll();
+      hint('已停止生成。已完成的图不会白跑。', 'info');
+      return;
+    }
+    const segs = state.segs.filter((s) => s.imageIds.length);
+    if (!segs.length) { hint('每段都要先配一张图。', 'warn'); return; }
+    const need = [...new Set(segs.flatMap((s) => s.imageIds))];
+    enqueueStrokes(need);
+  });
+  $('voiceAllBtn')?.addEventListener('click', () => genVoiceAll(false));
   $('expBtn').addEventListener('click', doExport);
 
   $('playBtn').addEventListener('click', () => { if (state.playing) pause(); else play(); });
@@ -1604,6 +1811,10 @@ if (new URLSearchParams(location.search).has('debug')) {
     reorderSeg, reorderAssets, removeAsset, removeSeg, cycleAsset, setSegImages, setSegCaptions,
     undoDepth: () => (undoStack ? undoStack.past.length : 0),
     undoLabel: () => (undoStack ? undoStack.undoLabel() : ''),
+    queueItems: () => (taskQueue ? taskQueue.items.map((i) => ({ ...i })) : []),
+    queueAdd: (t) => { taskQueue?.add(t); taskQueue?.start(); },
+    queueAbortAll: () => taskQueue?.abortAll(),
+    genVoiceAll,
   };
 }
 
