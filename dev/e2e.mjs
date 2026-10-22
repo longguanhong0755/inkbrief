@@ -5,7 +5,9 @@ import fs from 'node:fs';
 const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.PLAYWRIGHT_CORE || 'playwright-core');
 
-const BASE = process.env.URL || 'http://127.0.0.1:8742';
+const BASE = process.env.URL || 'http://127.0.0.1:8743/inkbrief';
+// ENGINE=pinned|latest|dev 可以指定引擎通道；不设则由页面按环境选
+const PAGE = BASE + '/index.html?debug=1' + (process.env.ENGINE ? '&engine=' + encodeURIComponent(process.env.ENGINE) : '');
 const OUT = 'dev/out';
 fs.mkdirSync(OUT, { recursive: true });
 
@@ -28,7 +30,7 @@ page.on('pageerror', (e) => errors.push('pageerror: ' + String(e).slice(0, 240))
 
 const T = (label) => console.log(`\n── ${label} ──`);
 
-await page.goto(BASE + '/index.html?debug=1', { waitUntil: 'domcontentloaded' });
+await page.goto(PAGE, { waitUntil: 'domcontentloaded' });
 await page.waitForFunction(() => document.getElementById('boot')?.hidden === true, null, { timeout: 180000 });
 ok('语音引擎就绪', true);
 

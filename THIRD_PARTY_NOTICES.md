@@ -6,7 +6,7 @@ inkbrief 的绘制引擎来自 image2strokes，手写字体来自 Google Fonts�
 
 | 组件 | 位置 | 许可 |
 |---|---|---|
-| image2strokes | `js/vendor/pipeline.js` | MIT |
+| image2strokes | 运行时从 image2strokes 站点加载 `js/engine.js`（不在本仓库） | MIT |
 | onnxruntime-web | `js/vendor/ort/` | MIT |
 | pinyin-pro | `js/vendor/pinyin-pro.min.js` | MIT |
 | mp4-muxer | `js/vendor/mp4-muxer/` | MIT |
@@ -14,7 +14,7 @@ inkbrief 的绘制引擎来自 image2strokes，手写字体来自 Google Fonts�
 | Ma Shan Zheng 字体 | `assets/fonts/` | SIL OFL 1.1 |
 | espeak-ng（**仅开发期**，不随产品分发） | — | GPL-3.0 |
 
-## image2strokes（vendored 在 `js/vendor/pipeline.js`）
+## image2strokes（运行时加载，不在本仓库副本）
 
 Source: <https://github.com/longguanhong0755/image2strokes>
 
@@ -42,7 +42,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-`js/vendor/pipeline.js` 只做了两件事：文件头加了这段署名；其余保持 v20（commit `5cf7fea`）原样。
+inkbrief 不复制 image2strokes 的代码，而是在 Worker 里加载它的稳定入口
+`js/engine.js`（优先同源兄弟目录，其次线上站点，最后退到固定 commit）。
+加载的是同一份 MIT 代码，版权与许可声明随上游仓库保留；这里保留完整许可证正文。
 
 ## onnxruntime-web（`js/vendor/ort/`）
 

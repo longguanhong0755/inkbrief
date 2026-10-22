@@ -4,7 +4,7 @@ import path from 'node:path';
 const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.PLAYWRIGHT_CORE || 'playwright-core');
 
-const BASE = process.env.URL || 'http://127.0.0.1:8743';
+const BASE = process.env.URL || 'http://127.0.0.1:8743/inkbrief';
 const browser = await chromium.launch({
   executablePath: 'C:/Program Files/Google/Chrome/Application/chrome.exe',
   headless: true, args: ['--no-sandbox'],

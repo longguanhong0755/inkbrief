@@ -1,6 +1,6 @@
 // 逐笔渲染器：从 image2strokes 的 app.js 移植（paintStroke / clip 掩膜 / 笔尖）。
 // 只负责把"第 pos 笔、进度 u"画到离屏画布；不负责 UI、时间轴、导出。
-import { buildOrder } from './stroke-order.js?v=10';
+import { buildOrder } from './stroke-order.js?v=11';
 
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 function hash01(a, b) {

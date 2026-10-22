@@ -6,8 +6,9 @@
   "description": "多图 + 多段文案 → 带本地配音和手写字幕的手绘讲解视频（纯前端，导出 MP4）",
   "license": "MIT",
   "scripts": {
-    "start": "python -m http.server 8000",
+    "start": "node dev/serve.mjs",
     "test": "node dev/wsola_test.mjs",
+    "test:unit": "node dev/wsola_test.mjs && node dev/timeline_check.mjs && node dev/scheduler_test.mjs && node dev/tts_punct_test.mjs",
     "test:e2e": "node dev/e2e.mjs",
     "test:edge": "node dev/e2e_edge.mjs",
     "test:smoke": "node dev/smoke.mjs",
@@ -23,6 +24,9 @@
     "test:queue": "node dev/queue_test.mjs",
     "test:export": "node dev/export_test.mjs",
     "test:interaction": "node dev/interaction_test.mjs",
+    "check:engine": "node dev/engine_contract.mjs",
+    "check:pin": "node dev/engine_contract.mjs --remote",
+    "engine:bump": "node dev/engine_bump.mjs",
     "tts:chars": "node dev/gen_zh_dict.mjs",
     "tts:phonemes": "node dev/build_zh_phonemes.mjs",
     "tts:table": "node dev/build_phoneme_ids.mjs"

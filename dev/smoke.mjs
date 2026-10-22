@@ -5,7 +5,7 @@ const { chromium } = require(process.env.PLAYWRIGHT_CORE || 'playwright-core');
 
 // 约定：URL 只给 base（不含 /index.html），脚本自己拼路径。
 // 和 dev/e2e.mjs、dev/e2e_edge.mjs 保持一致，避免「传了 base 却少了 ?debug=1」这类坑。
-const BASE = process.env.URL || 'http://127.0.0.1:8742';
+const BASE = process.env.URL || 'http://127.0.0.1:8743/inkbrief';
 const PAGE = BASE + '/index.html?debug=1';
 
 const browser = await chromium.launch({

@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '0 3 * * 1'   # 每周一跑一次，检查上游引擎有没有把契约改坏
+  workflow_dispatch:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: inkbrief
+
+      # 两个仓库并排 checkout，inkbrief 的契约测试按 ../image2strokes 找引擎
+      - uses: actions/checkout@v4
+        with:
+          repository: longguanhong0755/image2strokes
+          path: image2strokes
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 引擎契约 + 纯逻辑测试
+        working-directory: inkbrief
+        run: |
+          npm run check:engine
+          npm run test:unit
+          npm run test:decimate
+
+      - name: 生产锁定版本可用
+        working-directory: inkbrief
+        run: npm run check:pin

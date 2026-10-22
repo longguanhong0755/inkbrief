@@ -2,7 +2,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import v8 from 'node:v8';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readRaw } from './raw.mjs';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+// 引擎来自独立的 image2strokes 项目，不在本仓库留副本。
+// 两个项目没放在同一父目录时，用 IMG2S_PIPELINE 指到 image2strokes/js/pipeline.js。
+const ENGINE = process.env.IMG2S_PIPELINE || path.resolve(HERE, '../../../image2strokes/js/pipeline.js');
 
 export const OPTS = {
   colors: 0,          // 自动（与网页默认一致）
@@ -21,7 +27,10 @@ export async function pipelineFor(fixture, opts = OPTS) {
   if (fs.existsSync(cacheFile) && fs.statSync(cacheFile).mtimeMs > fs.statSync(fixture).mtimeMs) {
     return { res: v8.deserialize(fs.readFileSync(cacheFile)), cached: true };
   }
-  await import('../../js/vendor/pipeline.js');
+  if (!fs.existsSync(ENGINE)) {
+    throw new Error(`找不到 image2strokes 引擎：${ENGINE}\n用 IMG2S_PIPELINE=<path/to/pipeline.js> 指定`);
+  }
+  await import(pathToFileURL(ENGINE).href);
   const P = globalThis.ISP_PIPELINE;
   const img = readRaw(fixture);
   let last = '';

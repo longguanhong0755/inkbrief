@@ -143,9 +143,28 @@ js/
   audio/
     wsola.js        变速不变调、重采样、归一化
     mix.js          按时间轴铺音轨
-  vendor/           pipeline.js（笔触引擎）、ort、pinyin-pro、mp4-muxer
+  vendor/           ort、pinyin-pro、mp4-muxer
 assets/tts/         模型 + 音素表
 ```
+
+**笔触引擎不在本仓库。** 依赖声明只有 `js/engine-config.js` 一个文件，
+`js/worker.js` 在运行时加载 image2strokes 的稳定入口 `js/engine.js`。
+
+| 通道 | 用哪个引擎 | 什么时候用 |
+|---|---|---|
+| `pinned`（线上默认） | 锁定一个已验证 commit（jsDelivr） | 上游更新不会直接改线上行为 |
+| `dev`（本地默认） | 同源兄弟目录里的最新 image2strokes | 改引擎立刻能看到效果 |
+| `latest` | image2strokes 线上站点的最新版 | 上线前手动验新版 |
+
+页面 URL 加 `?engine=pinned|dev|latest` 可以临时切换。升级引擎：
+
+```bash
+npm run engine:bump     # 把 pin 抬到 image2strokes 当前 HEAD
+npm run check:pin       # 真的下载并跑一遍这个版本
+```
+
+契约（`ISP_PIPELINE.api`）不匹配时 Worker 会自动换下一个候选，最后退到 pinned，
+所以上游改坏接口不会把 inkbrief 带崩。详见 image2strokes 的 `ENGINE_CONTRACT.md`。
 
 关键优化（这几条决定了能不能实时播）：
 
@@ -155,11 +174,20 @@ assets/tts/         模型 + 音素表
 
 ## 本地跑
 
+两个项目并排放在同一父目录（`inkbrief/` 和 `image2strokes/`），然后：
+
 ```bash
 cd inkbrief
-python -m http.server 8000
-# 打开 http://127.0.0.1:8000
+npm start
+# 打开 http://127.0.0.1:8743/inkbrief/
 ```
+
+`dev/serve.mjs` 用同一个端口同时服务 `/inkbrief/` 和 `/image2strokes/`，
+所以 Worker 能直接加载兄弟目录里的最新引擎，不用联网。它支持 Range，
+TTS 模型和 wasm 的分片下载在本地也走真实分支。
+
+两个项目不并排、或只想单独跑 inkbrief 时也能启动，引擎会自动退到线上；
+用 `ROOT=/path/to/parent PORT=9000 npm start` 可以改根目录和端口。
 
 纯静态，没有构建步骤。
 
@@ -183,7 +211,7 @@ Range 时会自动退回整包下载。
 
 **改完 js 记得改版本号。** 入口脚本和模块引用都带 `?v=N`（见 `index.html` 与 `js/main.js`），
 Pages 对 `.js` 有 10 分钟缓存，只改内容不改 URL 的话老访客会继续用旧文件。改代码时把
-`?v=10` 一起升上去。
+`?v=11` 一起升上去。
 
 ## 测试
 
@@ -208,12 +236,18 @@ npm run test:interaction   # 交互综合（29 项）
 npm run test:tts           # 音标/标点（26 项）
 npm run test:decimate      # 抽稀策略（39 项）
 npm run test:scheduler     # 任务队列纯逻辑（41 项，不用浏览器）
+npm run check:engine       # 引擎契约 + 真的跑一遍小图（不用浏览器）
+npm run check:pin          # 下载并验证生产锁定的引擎版本
 ```
+
+`npm run test:unit` 会把四组纯逻辑测试一次跑完，CI 用的就是它。
+GitHub Actions（`.github/workflows/ci.yml`）会同时 checkout 两个仓库，
+跑契约测试、纯逻辑测试和 pinned 版本检查。
 
 跑浏览器测试时用 `URL=` 指向本地服务器，例如：
 
 ```bash
-URL=http://127.0.0.1:8743 npm run test:e2e
+URL=http://127.0.0.1:8743/inkbrief npm run test:e2e
 ```
 
 `test:perf` 会把四类 seek 都打出来，只有「拖进度条」那一类参与断言——

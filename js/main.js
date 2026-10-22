@@ -1,20 +1,20 @@
 // inkbrief 主逻辑：多图 + 多段 → 逐屏手绘 + 本地 TTS 配音 + 字幕 → 导出 MP4。
-import { StrokeRenderer, getAtlas, dropAtlas } from './core/renderer.js?v=10';
-import { Compositor, computeLayout } from './core/compositor.js?v=10';
-import { CaptionPainter } from './core/subtitle.js?v=10';
+import { StrokeRenderer, getAtlas, dropAtlas } from './core/renderer.js?v=11';
+import { Compositor, computeLayout } from './core/compositor.js?v=11';
+import { CaptionPainter } from './core/subtitle.js?v=11';
 import {
   buildTimeline, sceneAt, drawProgress, estimateDurationMs,
   itemAt, captionAt,
-} from './core/timeline.js?v=10';
-import { TTSEngine, VOICES, loadModel } from './tts/engine.js?v=10';
-import { buildSoundtrack, toAudioBuffer } from './audio/mix.js?v=10';
-import { exportVideo, exportVideoOffline, downloadBlob, pickMime, probeCodecs } from './core/exporter.js?v=10';
-import { makeDraggable, resolveDrop, applyDrop } from './ui/dragdrop.js?v=10';
-import { createTimelineView } from './ui/timeline-view.js?v=10';
-import { createScenePanel } from './ui/scene-panel.js?v=10';
-import { UndoStack } from './ui/undo.js?v=10';
-import { TaskQueue } from './core/scheduler.js?v=10';
-import { createQueuePanel } from './ui/queue-panel.js?v=10';
+} from './core/timeline.js?v=11';
+import { TTSEngine, VOICES, loadModel } from './tts/engine.js?v=11';
+import { buildSoundtrack, toAudioBuffer } from './audio/mix.js?v=11';
+import { exportVideo, exportVideoOffline, downloadBlob, pickMime, probeCodecs } from './core/exporter.js?v=11';
+import { makeDraggable, resolveDrop, applyDrop } from './ui/dragdrop.js?v=11';
+import { createTimelineView } from './ui/timeline-view.js?v=11';
+import { createScenePanel } from './ui/scene-panel.js?v=11';
+import { UndoStack } from './ui/undo.js?v=11';
+import { TaskQueue } from './core/scheduler.js?v=11';
+import { createQueuePanel } from './ui/queue-panel.js?v=11';
 
 const $ = (id) => document.getElementById(id);
 const MAX_SEGS = 12;
@@ -52,6 +52,10 @@ const state = {
 let worker = null;
 let jobSeq = 0;
 const pendingJobs = new Map();
+// 笔触引擎（image2strokes）是外部依赖：worker 起来后先握手，拿到 api 版本才算就绪
+let engineInfo = null;
+let engineError = null;
+const engineWaiters = [];
 let compositor = null;
 let painter = null;
 let timelineView = null;
@@ -204,11 +208,48 @@ function updateVoiceAllHint() {
 const voiceOf = (id = state.voiceId) => VOICES.find((v) => v.id === id) || VOICES[0];
 
 // ── 管线 worker ───────────────────────────────────────
+// image2strokes 引擎是外部依赖（见 js/worker.js 的候选地址），加载完会发 ready。
+function settleEngine(info, err) {
+  if (info) { engineInfo = info; engineError = null; }
+  else { engineInfo = null; engineError = err || new Error('笔触引擎加载失败'); }
+  while (engineWaiters.length) {
+    const w = engineWaiters.shift();
+    clearTimeout(w.timer);
+    if (info) w.resolve(info); else w.reject(engineError);
+  }
+}
+
+function whenEngineReady() {
+  if (engineInfo) return Promise.resolve(engineInfo);
+  if (engineError) return Promise.reject(engineError);
+  return new Promise((resolve, reject) => {
+    const w = { resolve, reject, timer: null };
+    w.timer = setTimeout(() => {
+      const i = engineWaiters.indexOf(w);
+      if (i >= 0) engineWaiters.splice(i, 1);
+      reject(new Error('笔触引擎加载超时（image2strokes 不可达）'));
+    }, 20000);
+    engineWaiters.push(w);
+  });
+}
+
 function initWorker() {
   try {
-    worker = new Worker('js/worker.js');
+    // ?engine=pinned|latest|dev 透传给 Worker；不传时由 Worker 按环境选默认通道
+    const engineChannel = new URLSearchParams(location.search).get('engine');
+    const workerUrl = 'js/worker.js?v=11' + (engineChannel ? '&engine=' + encodeURIComponent(engineChannel) : '');
+    worker = new Worker(workerUrl);
     worker.onmessage = (e) => {
       const d = e.data || {};
+      if (d.type === 'ready') {
+        settleEngine({ api: d.api, version: d.version, url: d.url }, null);
+        return;
+      }
+      if (d.type === 'error' && d.fatal) {
+        settleEngine(null, new Error(d.msg || '笔触引擎加载失败'));
+        hint(d.msg || '笔触引擎加载失败', 'warn');
+        return;
+      }
       const job = pendingJobs.get(d.jobId);
       if (!job) return;
       if (d.type === 'progress') job.onProgress?.(d.p, d.msg);
@@ -216,21 +257,23 @@ function initWorker() {
       else if (d.type === 'error') { pendingJobs.delete(d.jobId); job.reject(new Error(d.msg)); }
     };
     worker.onerror = (e) => {
-      for (const [, j] of pendingJobs) j.reject(new Error('管线异常：' + (e.message || '未知')));
+      settleEngine(null, new Error('管线异常：' + (e.message || '未知')));
+      for (const [, j] of pendingJobs) j.reject(engineError);
       pendingJobs.clear();
     };
   } catch (err) {
+    settleEngine(null, new Error('无法启动笔触引擎：' + err.message));
     hint('无法启动笔触引擎：' + err.message, 'warn');
   }
 }
 
 function runPipeline(px, W, H, onProgress) {
-  return new Promise((resolve, reject) => {
+  return whenEngineReady().then(() => new Promise((resolve, reject) => {
     if (!worker) return reject(new Error('笔触引擎未就绪'));
     const jobId = ++jobSeq;
     pendingJobs.set(jobId, { resolve, reject, onProgress });
     worker.postMessage({ jobId, px: px.buffer, W, H, opts: PIPE_OPTS }, [px.buffer]);
-  });
+  }));
 }
 
 // ── 素材 ──────────────────────────────────────────────
@@ -1918,6 +1961,7 @@ if (new URLSearchParams(location.search).has('debug')) {
   window.__ink = {
     get state() { return state; },
     get timeline() { return state.timeline; },
+    get engine() { return engineInfo; },
     renderAt, generate, play, pause, rebuild, renderSegs,
     synth: (t) => state.tts.synth(t, voiceOf()),
     addFiles, splitScript,

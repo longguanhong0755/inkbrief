@@ -4,7 +4,7 @@ import path from 'node:path';
 const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.PLAYWRIGHT_CORE || 'playwright-core');
 
-const BASE = process.env.URL || 'http://127.0.0.1:8743';
+const BASE = process.env.URL || 'http://127.0.0.1:8743/inkbrief';
 
 let pass = 0, fail = 0;
 const ok = (name, cond, detail = '') => {
@@ -28,7 +28,8 @@ await page.waitForFunction(() => document.getElementById('boot')?.hidden === tru
 
 T('能力探测：Video / Audio 分开');
 const caps = await page.evaluate(async () => {
-  const m = await import('/js/core/exporter.js');
+  // 相对页面 URL 解析：页面在 /inkbrief/ 下也能找到模块
+  const m = await import('./js/core/exporter.js');
   return m.probeCodecs();
 });
 ok('有 VideoEncoder', caps.hasVideoEncoder === true);

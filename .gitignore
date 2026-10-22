@@ -5,3 +5,5 @@ dev/out/
 
 # 含凭证/敏感信息的内部交接文档，绝不进公开仓库（见 PERF_HANDOFF.md 第 9 节）
 PERF_HANDOFF.md
+HANDOFF_PHASE9.md
+HANDOFF.md
