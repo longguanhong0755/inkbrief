@@ -172,17 +172,24 @@ export function createTimelineView(o) {
 
     e.preventDefault();
     const blocks = [...elTrack.querySelectorAll('.tl-block')];
+    // 拖拽开始时把每个块的矩形量好，之后命中测试全靠算术，不再读布局
+    const rects = blocks.map((el) => ({ el, r: el.getBoundingClientRect() }));
     drag = {
       kind: h.kind,
       segId,
       el: h.el,
       startX: e.clientX,
+      lastX: e.clientX,
+      lastY: e.clientY,
       fromIndex: sc.index,
       toIndex: sc.index,
       width: h.rect.width,
       ms: sc.dur,
       pxPerMs: track?.pxPerMs || 1,
       blocks,
+      rects,
+      lastTarget: null,
+      raf: 0,
       moved: false,
     };
     elTrack.classList.add('dragging');
@@ -190,18 +197,27 @@ export function createTimelineView(o) {
     document.addEventListener('pointerup', onUp);
   };
 
-  /** 找出指针当前落在哪一块（跳过正在拖的那一块自己） */
+  /**
+   * 找出指针当前落在哪一块。
+   *
+   * 不用 document.elementFromPoint——它会强制刷新样式和布局，
+   * 紧跟在 style.transform 写入之后就是典型的「写完立刻读」布局抖动，
+   * 高频鼠标下每秒能触发上百次强制 reflow。
+   * 改成用拖拽开始时缓存下来的块矩形做纯算术判断。
+   */
   function blockUnder(x, y, self) {
-    const el = document.elementFromPoint(x, y);
-    if (!el) return null;
-    const b = el.closest('.tl-block');
-    if (!b || b === self) return null;
-    return b;
+    for (const b of drag.rects) {
+      if (b.el === self) continue;
+      const r = b.r;
+      if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return b.el;
+    }
+    return null;
   }
 
-  const onMove = (e) => {
+  /** 真正落到 DOM 上的动作，一帧只做一次 */
+  function applyDrag() {
     if (!drag) return;
-    const dx = e.clientX - drag.startX;
+    const dx = drag.lastX - drag.startX;
     if (!drag.moved && Math.abs(dx) < 4) return;
     drag.moved = true;
 
@@ -219,19 +235,36 @@ export function createTimelineView(o) {
     // 移动整块：只改 transform，pointerup 才提交
     drag.el.classList.add('moving');
     drag.el.style.transform = `translateX(${dx}px)`;
-    // 算落在哪一块上（自己不算，拖动块 pointer-events:none，elementFromPoint 会穿透）
-    const over = blockUnder(e.clientX, e.clientY, drag.el);
-    if (over) {
-      drag.toIndex = Number(over.dataset.idx ?? 0);
-      for (const b of drag.blocks) b.classList.remove('drop-target');
-      over.classList.add('drop-target');
+    // 算落在哪一块上（自己不算，拖动块 pointer-events:none，命中会穿透）
+    const over = blockUnder(drag.lastX, drag.lastY, drag.el);
+    const idx = over ? Number(over.dataset.idx ?? 0) : -1;
+    // 只在目标真的变了才改 class（早先每个事件都把全部块扫一遍）
+    if (idx !== drag.toIndex) {
+      if (drag.lastTarget) drag.lastTarget.classList.remove('drop-target');
+      drag.toIndex = idx;
+      drag.lastTarget = over || null;
+      if (over) over.classList.add('drop-target');
     }
+  }
+
+  const onMove = (e) => {
+    if (!drag) return;
+    drag.lastX = e.clientX;
+    drag.lastY = e.clientY;
+    // rAF 节流：一帧最多做一次 DOM 动作
+    if (drag.raf) return;
+    drag.raf = requestAnimationFrame(() => {
+      if (drag) drag.raf = 0;
+      applyDrag();
+    });
   };
 
   const onUp = (e) => {
     if (!drag) return;
     const d = drag;
     drag = null;
+    // 取消还没执行的那一帧，但先把最后的位置补上
+    if (d.raf) { cancelAnimationFrame(d.raf); d.raf = 0; }
     elTrack.classList.remove('dragging');
     document.removeEventListener('pointermove', onMove);
     document.removeEventListener('pointerup', onUp);
@@ -251,11 +284,22 @@ export function createTimelineView(o) {
     }
 
     if (d.kind === 'resize') {
+      // 最后一帧的位置可能还没算过，补一次
+      d.lastX = e.clientX;
+      d.lastY = e.clientY;
+      drag = d;
+      applyDrag();
+      drag = null;
       if (d.nextMs && d.nextMs !== d.ms) o.onResize?.(d.segId, d.nextMs);
       return;
     }
 
     // 重排：算目标位置
+    d.lastX = e.clientX;
+    d.lastY = e.clientY;
+    drag = d;
+    applyDrag();
+    drag = null;
     if (d.toIndex !== d.fromIndex) o.onReorder?.(d.fromIndex, d.toIndex);
   };
 

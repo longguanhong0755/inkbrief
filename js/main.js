@@ -1,20 +1,20 @@
 // inkbrief 主逻辑：多图 + 多段 → 逐屏手绘 + 本地 TTS 配音 + 字幕 → 导出 MP4。
-import { StrokeRenderer } from './core/renderer.js?v=9';
-import { Compositor, computeLayout } from './core/compositor.js?v=9';
-import { CaptionPainter } from './core/subtitle.js?v=9';
+import { StrokeRenderer, getAtlas, dropAtlas } from './core/renderer.js?v=10';
+import { Compositor, computeLayout } from './core/compositor.js?v=10';
+import { CaptionPainter } from './core/subtitle.js?v=10';
 import {
   buildTimeline, sceneAt, drawProgress, estimateDurationMs,
   itemAt, captionAt,
-} from './core/timeline.js?v=9';
-import { TTSEngine, VOICES, loadModel } from './tts/engine.js?v=9';
-import { buildSoundtrack, toAudioBuffer } from './audio/mix.js?v=9';
-import { exportVideo, exportVideoOffline, downloadBlob, pickMime, probeCodecs } from './core/exporter.js?v=9';
-import { makeDraggable, resolveDrop, applyDrop } from './ui/dragdrop.js?v=9';
-import { createTimelineView } from './ui/timeline-view.js?v=9';
-import { createScenePanel } from './ui/scene-panel.js?v=9';
-import { UndoStack } from './ui/undo.js?v=9';
-import { TaskQueue } from './core/scheduler.js?v=9';
-import { createQueuePanel } from './ui/queue-panel.js?v=9';
+} from './core/timeline.js?v=10';
+import { TTSEngine, VOICES, loadModel } from './tts/engine.js?v=10';
+import { buildSoundtrack, toAudioBuffer } from './audio/mix.js?v=10';
+import { exportVideo, exportVideoOffline, downloadBlob, pickMime, probeCodecs } from './core/exporter.js?v=10';
+import { makeDraggable, resolveDrop, applyDrop } from './ui/dragdrop.js?v=10';
+import { createTimelineView } from './ui/timeline-view.js?v=10';
+import { createScenePanel } from './ui/scene-panel.js?v=10';
+import { UndoStack } from './ui/undo.js?v=10';
+import { TaskQueue } from './core/scheduler.js?v=10';
+import { createQueuePanel } from './ui/queue-panel.js?v=10';
 
 const $ = (id) => document.getElementById(id);
 const MAX_SEGS = 12;
@@ -241,13 +241,15 @@ async function addFiles(files) {
     try {
       const img = await loadImage(f);
       const scaled = scaleTo(img, MAX_EDGE);
+      // object URL 不 revoke：删图可以撤销，assetPool 会一直持有资产（见下方「所有素材都留在 assetPool」）
+      const url = await canvasObjectUrl(scaled.canvas);
       const asset = {
         id: uid(),
         name: f.name.replace(/\.[^.]+$/, ''),
         el: scaled.canvas,
         w: scaled.w,
         h: scaled.h,
-        url: scaled.canvas.toDataURL('image/jpeg', 0.8),
+        url,
         strokes: null,
         clips: null,
         pipelineMs: 0,
@@ -286,6 +288,12 @@ function scaleTo(img, maxEdge) {
   x.imageSmoothingQuality = 'high';
   x.drawImage(img, 0, 0, w, h);
   return { canvas: cv, w, h };
+}
+
+function canvasObjectUrl(cv) {
+  return new Promise((resolve) => {
+    cv.toBlob((blob) => resolve(URL.createObjectURL(blob)), 'image/jpeg', 0.8);
+  });
 }
 
 function renderThumbs() {
@@ -588,6 +596,8 @@ function removeAsset(assetId) {
   if (!a) return;
   undoable('删掉一张图', () => {
     state.assets = state.assets.filter((x) => x.id !== assetId);
+    // 这张图的掩膜图集没人用了，放掉（否则显存一直占着）
+    dropAtlas(assetId);
     for (const s of state.segs) {
       const i = s.imageIds.indexOf(assetId);
       if (i >= 0) s.imageIds.splice(i, 1);
@@ -1000,6 +1010,9 @@ async function generate() {
       const res = await runPipeline(px, a.w, a.h, (p) => {
         hint(`正在分析图片 ${done + 1}/${need.length}：「${a.name}」 ${Math.round((p || 0) * 100)}%`);
       });
+      // 图集按 assetId 共享：笔触一换，旧掩膜和基于旧 strokes 的渲染器都必须失效
+      dropAtlas(a.id);
+      state.renderers.clear();
       a.strokes = res.strokes;
       a.clips = res.clips;
       a.pipelineMs = performance.now() - t0;
@@ -1094,6 +1107,9 @@ function enqueueStrokes(assetIds) {
           ctx.onProgress(p || 0);
         });
         if (ctx.signal.aborted) return;
+        // 图集按 assetId 共享：笔触一换，旧掩膜和基于旧 strokes 的渲染器都必须失效
+        dropAtlas(a.id);
+        state.renderers.clear();
         a.strokes = res.strokes;
         a.clips = res.clips;
         a.pipelineMs = performance.now() - t0;
@@ -1539,8 +1555,11 @@ function rendererFor(sc, item) {
   if (rec && rec.assetId === asset.id && rec.count === n && rec.keep === keep) return rec;
 
   // 抽稀策略见 core/stroke-order.js：整块优先，不丢笔造成白斑
+  // 图集按资产共享：掩膜只跟资产有关，跟 keep 无关。
+  // 不共享的话，用户拖一下时长滑块（keep 变）就得重打包 8000 多个掩膜，卡 4 秒。
   const rd = StrokeRenderer.create({
     W: asset.w, H: asset.h, strokes: asset.strokes, clips: asset.clips, keep,
+    atlas: getAtlas(asset.id),
   });
   rec = { rd, assetId: asset.id, count: n, keep, orderLen: rd.order.length, key };
   state.renderers.set(key, rec);
@@ -1910,6 +1929,53 @@ if (new URLSearchParams(location.search).has('debug')) {
     queueAdd: (t) => { taskQueue?.add(t); taskQueue?.start(); },
     queueAbortAll: () => taskQueue?.abortAll(),
     genVoiceAll,
+    // 帧内开销剖析用：把一次 renderAt 拆成各部分单独计时
+    __compositorDrawOnly: () => {
+      const st = frameStateAt(state.ms);
+      if (!st) return;
+      const lay = computeLayout(state.W, state.H, { capPos: st.sc.capPos });
+      compositor.draw({
+        bitmap: st.asset.el, imgW: st.asset.w, imgH: st.asset.h,
+        painted: st.painted, partial: st.partial, tip: st.tip,
+        tipAlpha: st.tipAlpha, layout: lay,
+      });
+    },
+    __captionDrawOnly: () => {
+      const st = frameStateAt(state.ms);
+      if (!st) return;
+      const lay = computeLayout(state.W, state.H, { capPos: st.sc.capPos });
+      painter.draw(compositor.ctx, {
+        key: st.capKey, text: st.capText, reveal: st.reveal,
+        alpha: st.alpha, seed: st.sc.index * 37, box: lay.cap,
+      });
+    },
+    __seekOnly: (u) => {
+      const sc = state.timeline.scenes[state.timeline.scenes.length - 1];
+      for (const rec of state.renderers.values()) {
+        if (rec.key === sc.id || rec.key.startsWith(sc.id + '#')) {
+          rec.rd.seekTo(Math.floor(rec.rd.order.length * 0.5), u);
+          return;
+        }
+      }
+    },
+    // 重建一个渲染器（模拟改时长导致 keep 变化后的缓存 miss）
+    __makeRenderer: (sc, itemIndex) => {
+      const item = sc.items ? sc.items[itemIndex] : null;
+      return rendererFor(sc, item);
+    },
+    // 用指定 keep 新建一个渲染器（不写进缓存），用来量掩膜打包成本
+    __makeRendererWithKeep: (sc, keep) => {
+      const asset = state.assets.find((a) => a.id === sc.assetId);
+      if (!asset) return null;
+      return StrokeRenderer.create({
+        W: asset.w, H: asset.h, strokes: asset.strokes, clips: asset.clips, keep,
+        atlas: getAtlas(asset.id),
+      });
+    },
+    __ensureMix: () => ensureMix(),
+    __queuePanelUpdate: (list) => {
+      queuePanel?.setItems(list || (taskQueue ? taskQueue.items.map((i) => ({ ...i })) : []), true);
+    },
   };
 }
 

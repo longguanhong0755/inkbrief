@@ -22,6 +22,9 @@ const LIM = {
   gen8: 240_000,     // 8 屏生成上限（ms）
   fixedMs: 2,        // 无新笔时的固定渲染开销（ms）
   perStroke: 1.0,    // 单笔渲染成本（ms）
+  atlasReuse: 500,   // 改 keep 重建渲染器（图集按资产复用，不该重打包）（ms）
+  queueUpdate: 2,    // 队列面板 12 项同步差量更新一次（ms）
+  assetUrl: 1000,    // 素材缩略图 URL 长度（base64 会到几十万字节）
 };
 
 const browser = await chromium.launch({
@@ -112,7 +115,7 @@ const perf = await page.evaluate(() => {
 });
 console.log('  ' + JSON.stringify(perf));
 
-T('断言 1/5：seek 延迟 P95');
+T('断言 1/8：seek 延迟 P95');
 // seek 要分四类量，因为成本完全不同：
 //   拖进度条 —— 一次 pointermove 只跨十几毫秒，补的笔很少 ← 唯一拿来做断言的
 //   大跨步向前 —— 一步吃掉 1/30 屏（约 370 笔），「点场景标签」那个量级
@@ -194,24 +197,24 @@ console.log('  同屏向后（重画本屏，见 README 限制 6）', JSON.strin
 console.log('  跨屏（重画目标屏，见 README 限制 6）', JSON.stringify(seekStats));
 ok(`拖动进度条 seek P95 < ${LIM.seekP95}ms`, scrubStep.p95 < LIM.seekP95, `P95 ${scrubStep.p95}ms / 最大 ${scrubStep.max}ms（n=${scrubStep.n}）`);
 
-T('断言 2/5：生成 8 屏在预算内');
+T('断言 2/8：生成 8 屏在预算内');
 // 用 2 屏的实测单屏耗时线性外推到 8 屏（比真跑 8 屏快得多，量级够用）
 const perScene = genMs / Math.max(1, tl.length);
 const projected8 = perScene * 8;
 console.log(`  2 屏 ${(genMs / 1000).toFixed(1)}s → 单屏 ${(perScene / 1000).toFixed(1)}s → 8 屏外推 ${(projected8 / 1000).toFixed(1)}s`);
 ok(`8 屏外推 < ${LIM.gen8 / 1000}s`, projected8 < LIM.gen8, `${(projected8 / 1000).toFixed(1)}s`);
 
-T('断言 3/5：单笔渲染成本');
+T('断言 3/8：单笔渲染成本');
 const worstPer = Math.max(...perf.map((p) => p.perStrokeMs ?? 0));
 console.log('  单笔', perf.map((p) => `${p.perStrokeMs}ms`).join(' / '));
 ok(`单笔 < ${LIM.perStroke}ms`, worstPer > 0 && worstPer < LIM.perStroke, `最差 ${worstPer}ms`);
 
-T('断言 4/5：无新笔时的固定开销');
+T('断言 4/8：无新笔时的固定开销');
 const worstFixed = Math.max(...perf.map((p) => p.fixedMs));
 console.log('  固定开销', perf.map((p) => `${p.fixedMs}ms`).join(' / '));
 ok(`固定开销 < ${LIM.fixedMs}ms`, worstFixed < LIM.fixedMs, `最差 ${worstFixed}ms`);
 
-T('断言 5/5：抽稀零丢块（画面没有永久白斑）');
+T('断言 5/8：抽稀零丢块（画面没有永久白斑）');
 // 画到一屏末尾，检查整幅图里没有成片的空白
 const holes = await page.evaluate(() => {
   const tl = window.__ink.timeline;
@@ -255,6 +258,48 @@ const found = holes.filter((h) => h.found);
 ok('每一屏都找到了渲染器', found.length === holes.length, `${found.length}/${holes.length}`);
 const worstHole = Math.max(0, ...found.map((h) => (h.total ? h.blank / h.total : 0)));
 ok('白块格子占比 < 35%', worstHole < 0.35, `最差 ${(worstHole * 100).toFixed(1)}%`);
+
+T('断言 6/8：改 keep 重建渲染器不重打包掩膜');
+// 掩膜只跟资产有关；图集按 assetId 共享后，改时长导致 keep 变化应只重建 order。
+// 退回「每个渲染器一份图集」时这里会回到 4 秒量级。
+const atlasReuse = await page.evaluate(() => {
+  const tl = window.__ink.timeline;
+  const sc = tl.scenes[tl.scenes.length - 1];
+  const rec = window.__perfFindRenderer(sc.id);
+  if (!rec) return null;
+  const keep = Math.max(1, Math.floor(rec.orderLen * 0.9));
+  const t0 = performance.now();
+  window.__ink.__makeRendererWithKeep(sc, keep);
+  return { ms: +(performance.now() - t0).toFixed(1), keep };
+});
+console.log('  重建渲染器', JSON.stringify(atlasReuse));
+ok(`改 keep 重建 < ${LIM.atlasReuse}ms`, !!atlasReuse && atlasReuse.ms < LIM.atlasReuse,
+  atlasReuse ? `${atlasReuse.ms}ms（keep=${atlasReuse.keep}）` : '没找到渲染器');
+
+T('断言 7/8：队列面板差量更新');
+const queuePer = await page.evaluate(() => {
+  const ink = window.__ink;
+  const items = Array.from({ length: 12 }, (_, i) => ({
+    id: 'stroke:' + i, label: '分析笔触：sample-' + i, detail: '1280×853',
+    status: 'running', progress: 0, attempt: 1, aborting: false, error: '',
+  }));
+  const t0 = performance.now();
+  for (let k = 0; k < 200; k++) {
+    items[k % 12].progress = (k % 100) / 100;
+    ink.__queuePanelUpdate(items.map((x) => ({ ...x })));
+  }
+  const ms = (performance.now() - t0) / 200;
+  return { ms: +ms.toFixed(3), rows: document.querySelectorAll('.qp-item').length };
+});
+console.log('  单次更新', JSON.stringify(queuePer));
+ok(`12 项差量更新 < ${LIM.queueUpdate}ms/次`, queuePer.ms < LIM.queueUpdate && queuePer.rows === 12,
+  `${queuePer.ms}ms/次，${queuePer.rows} 行`);
+
+T('断言 8/8：缩略图不内联 base64');
+const urlBytes = await page.evaluate(() => window.__ink.state.assets.map((a) => (a.url || '').length));
+const worstUrl = Math.max(0, ...urlBytes);
+console.log('  素材 URL 字节', JSON.stringify(urlBytes));
+ok(`单张缩略图 URL < ${LIM.assetUrl} 字节`, worstUrl > 0 && worstUrl < LIM.assetUrl, `最长 ${worstUrl} 字节`);
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);
 await browser.close();
